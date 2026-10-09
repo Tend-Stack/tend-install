@@ -22,7 +22,10 @@ jobs:
           t="$(bearer repository:tend-stack/tend-host:pull,push)"
           c="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $t" -H 'Accept: application/vnd.oci.image.index.v1+json' https://ghcr.io/v2/tend-stack/tend-host/manifests/0.11.1)"
           echo "PULL public tend-stack/tend-host:0.11.1 -> HTTP $c"
-          h="$(curl -s -D - -o /dev/null -X POST -H "Authorization: Bearer $t" -H 'Content-Length: 0' https://ghcr.io/v2/tend-stack/tend-host/blobs/uploads/)"
+          h="$(curl -s -D - -o /tmp/up.body -X POST -H "Authorization: Bearer $t" -H 'Content-Length: 0' https://ghcr.io/v2/tend-stack/tend-host/blobs/uploads/)"
+          echo "PUSH body: $(head -c 300 /tmp/up.body)"
+          echo "TOKEN endpoint (push scope only): $(curl -s -u "x:$GT" 'https://ghcr.io/token?service=ghcr.io&scope=repository:tend-stack/tend-host:push' | jq -c 'if .token then {token:"(present)"} else . end')"
+          echo "actor=${GITHUB_ACTOR} repo=${GITHUB_REPOSITORY}"
           echo "PUSH open upload on tend-stack/tend-host -> $(printf '%s' "$h" | head -1 | tr -d '\r')"
           loc="$(printf '%s' "$h" | grep -i '^location:' | cut -d' ' -f2 | tr -d '\r')"
           if [ -n "$loc" ]; then case "$loc" in http*) u="$loc";; *) u="https://ghcr.io$loc";; esac; echo "cancel upload -> HTTP $(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $t" "$u")"; fi
