@@ -1,6 +1,7 @@
 name: Access probe (temporary, read-only)
-# Asks GHCR which actions this repository's GITHUB_TOKEN is granted, without
-# pulling layers or pushing anything. Removed after the auto-signing cutover check.
+# Checks what this repository's GITHUB_TOKEN may do on GHCR: pull the private
+# panel image's manifest, and open (then cancel) an upload session on the
+# public package. Nothing is pushed. Removed after the auto-signing cutover.
 on: workflow_dispatch
 permissions:
   contents: read
@@ -9,20 +10,19 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Ask GHCR for pull and push grants
+      - name: Probe pull and push
         env:
           GT: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
-          probe() { # scope
-            body="$(curl -s -u "x:$GT" "https://ghcr.io/token?service=ghcr.io&scope=$1")"
-            tok="$(printf '%s' "$body" | jq -r '.token // empty')"
-            if [ -z "$tok" ]; then echo "$1 -> no token: $(printf '%s' "$body" | jq -c '.errors // .' | cut -c1-200)"; return; fi
-            p="$(printf '%s' "$tok" | cut -d. -f2 | tr '_-' '/+')"; while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done
-            granted="$(printf '%s' "$p" | base64 -d 2>/dev/null | jq -c '.access' 2>/dev/null)"
-            echo "$1 -> granted ${granted:-unparsed}"
-          }
-          probe "repository:wilkinsantana/tend-host:pull"
-          probe "repository:tend-stack/tend-host:pull,push"
-          code="$(curl -s -o /dev/null -w '%{http_code}' -u "x:$GT" -H 'Accept: application/vnd.oci.image.index.v1+json' https://ghcr.io/v2/wilkinsantana/tend-host/manifests/0.11.1 || true)"
-          echo "private manifest HEAD with GITHUB_TOKEN basic auth: $code"
+          bearer() { curl -s -u "x:$GT" "https://ghcr.io/token?service=ghcr.io&scope=$1" | jq -r '.token // empty'; }
+          t="$(bearer repository:wilkinsantana/tend-host:pull)"
+          c="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $t" -H 'Accept: application/vnd.oci.image.index.v1+json' https://ghcr.io/v2/wilkinsantana/tend-host/manifests/0.11.1)"
+          echo "PULL private wilkinsantana/tend-host:0.11.1 -> HTTP $c"
+          t="$(bearer repository:tend-stack/tend-host:pull,push)"
+          c="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $t" -H 'Accept: application/vnd.oci.image.index.v1+json' https://ghcr.io/v2/tend-stack/tend-host/manifests/0.11.1)"
+          echo "PULL public tend-stack/tend-host:0.11.1 -> HTTP $c"
+          h="$(curl -s -D - -o /dev/null -X POST -H "Authorization: Bearer $t" -H 'Content-Length: 0' https://ghcr.io/v2/tend-stack/tend-host/blobs/uploads/)"
+          echo "PUSH open upload on tend-stack/tend-host -> $(printf '%s' "$h" | head -1 | tr -d '\r')"
+          loc="$(printf '%s' "$h" | grep -i '^location:' | cut -d' ' -f2 | tr -d '\r')"
+          if [ -n "$loc" ]; then case "$loc" in http*) u="$loc";; *) u="https://ghcr.io$loc";; esac; echo "cancel upload -> HTTP $(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $t" "$u")"; fi
