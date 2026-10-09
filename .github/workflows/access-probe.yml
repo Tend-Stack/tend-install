@@ -1,0 +1,27 @@
+name: Access probe (temporary, read-only)
+# Asks GHCR which actions this repository's GITHUB_TOKEN is granted, without
+# pulling layers or pushing anything. Removed after the auto-signing cutover check.
+on: workflow_dispatch
+permissions:
+  contents: read
+  packages: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ask GHCR for pull and push grants
+        env:
+          GT: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          probe() { # scope
+            body="$(curl -s -u "x:$GT" "https://ghcr.io/token?service=ghcr.io&scope=$1")"
+            tok="$(printf '%s' "$body" | jq -r '.token // empty')"
+            if [ -z "$tok" ]; then echo "$1 -> no token: $(printf '%s' "$body" | jq -c '.errors // .' | cut -c1-200)"; return; fi
+            granted="$(printf '%s' "$tok" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq -c '.access' 2>/dev/null)"
+            echo "$1 -> granted ${granted:-unparsed}"
+          }
+          probe "repository:wilkinsantana/tend-host:pull"
+          probe "repository:tend-stack/tend-host:pull,push"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -u "x:$GT" -H 'Accept: application/vnd.oci.image.index.v1+json' https://ghcr.io/v2/wilkinsantana/tend-host/manifests/0.11.1 || true)"
+          echo "private manifest HEAD with GITHUB_TOKEN basic auth: $code"
