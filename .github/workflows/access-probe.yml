@@ -13,12 +13,13 @@ jobs:
         env:
           GT: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -u
+          set +e
           probe() { # scope
             body="$(curl -s -u "x:$GT" "https://ghcr.io/token?service=ghcr.io&scope=$1")"
             tok="$(printf '%s' "$body" | jq -r '.token // empty')"
             if [ -z "$tok" ]; then echo "$1 -> no token: $(printf '%s' "$body" | jq -c '.errors // .' | cut -c1-200)"; return; fi
-            granted="$(printf '%s' "$tok" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq -c '.access' 2>/dev/null)"
+            p="$(printf '%s' "$tok" | cut -d. -f2 | tr '_-' '/+')"; while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done
+            granted="$(printf '%s' "$p" | base64 -d 2>/dev/null | jq -c '.access' 2>/dev/null)"
             echo "$1 -> granted ${granted:-unparsed}"
           }
           probe "repository:wilkinsantana/tend-host:pull"
