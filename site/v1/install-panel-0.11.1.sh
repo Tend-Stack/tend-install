@@ -14,7 +14,11 @@
 #   5. Writes ONE compose stack for both profiles: the panel, the Caddy edge
 #      the panel controls, and (home only) the mDNS name announcer. The panel
 #      image is pulled by the digest the signed manifest pins.
-#   6. Starts it, waits for the panel, shows the addresses and the setup code.
+#   6. Starts it, waits for the panel, then ends with one boxed screen: the
+#      address, the setup code and what to do next. If a web proxy (nginx,
+#      Apache, Caddy, Traefik, ...) already holds ports 80/443 it offers to stop
+#      it (typed `yes`), after the new stack is written; undo commands are
+#      saved to $INSTALL_DIR/ports-taken-over.txt.
 #
 # Addresses: a VPS gets https://tend.<ip-dashed>.sslip.io (a real certificate, no
 # domain needed) and http://<ip> redirects there. A home server gets
@@ -23,7 +27,9 @@
 # chain (ufw never sees them), restored at boot by a small systemd unit.
 #
 # Options: --public | --local, --local-name=<name>, --allow-downgrade,
-#          --use-existing-docker, --yes (no questions), --help
+#          --use-existing-docker, --yes (no questions), --help,
+#          --take-over-ports (stop a web proxy that holds ports 80/443 without
+#          asking; it is stopped and kept from starting at boot, never removed)
 # Environment: TEND_LOCAL_MODE=1|0, TEND_LOCAL_NAME, TEND_PUBLIC_IP,
 #   TEND_HOST_DOMAIN (+ TEND_HOST_DOMAIN_EMAIL) to use your own domain from the
 #   start, TEND_SETUP_CODE (automated installs; never written to disk),
@@ -49,8 +55,8 @@ FIREWALL_UNIT="tend-lan-firewall.service"
 
 # ---- output -----------------------------------------------------------------
 
-if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then C_STEP=$'\033[1;36m'; C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_BOLD=$'\033[1m'; C_OFF=$'\033[0m'
-else C_STEP=""; C_OK=""; C_WARN=""; C_ERR=""; C_BOLD=""; C_OFF=""; fi
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then C_STEP=$'\033[1;36m'; C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_OFF=$'\033[0m'; C_CODE=$'\033[1;33m'; C_TITLE=$'\033[1;32m'
+else C_STEP=""; C_OK=""; C_WARN=""; C_ERR=""; C_OFF=""; C_CODE=""; C_TITLE=""; fi
 c_step() { printf '\n%s==> %s%s\n' "$C_STEP" "$*" "$C_OFF"; }
 c_ok()   { printf '    %sOK%s  %s\n' "$C_OK" "$C_OFF" "$*"; }
 c_warn() { printf '    %s!!%s  %s\n' "$C_WARN" "$C_OFF" "$*"; }
@@ -61,6 +67,48 @@ apt_install() { DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o Dpkg::U
 dnf_install() { dnf install -y -q "$@" > /dev/null; }
 APPLIED=()
 record() { APPLIED+=("$1"); }
+TAKEOVER=() # front-door proxies to stop: "service<TAB>UNIT<TAB>PROC" or "container<TAB>NAME<TAB>IMAGE<TAB>ID"
+
+# ui_cols: the terminal width ($COLUMNS, else the controlling terminal, else 80).
+ui_cols() {
+  local c="${COLUMNS:-}"
+  if [[ ! $c =~ ^[0-9]+$ ]]; then c="$({ stty size < /dev/tty; } 2> /dev/null | awk '{print $2}')" || c=""; fi
+  [[ $c =~ ^[0-9]+$ ]] && ((c > 0)) || c=80
+  printf '%s' "$c"
+}
+# ui_unicode: the heavy box only on a colour terminal that speaks UTF-8.
+ui_unicode() { [[ -t 1 && -z ${NO_COLOR:-} ]] && [[ "$(locale charmap 2> /dev/null)" == UTF-8 ]]; }
+# ui_box TITLE ROW...: a row is `plain` or `plain<TAB>styled` (the styled text may
+# carry colour codes; padding comes from the plain text). A bordered box when the
+# terminal is at least 60 columns wide and every row fits 54 characters; else
+# borderless, between two rules, so a long address is never cut or wrapped.
+ui_box() {
+  local title="$1" row plain styled w=0 cols i n tab=$'\t' tl tr bl br h v bar rule
+  local -a P=("$title") S=("${C_TITLE:-}${title}${C_OFF:-}")
+  shift
+  for row in "$@"; do
+    plain="${row%%"$tab"*}"; styled="$plain"
+    [[ $row != *"$tab"* ]] || styled="${row#*"$tab"}"
+    P+=("$plain"); S+=("$styled")
+  done
+  for plain in "${P[@]}"; do ((${#plain} <= w)) || w=${#plain}; done
+  cols="$(ui_cols)"
+  if ((cols >= 60 && w <= 54)); then
+    if ui_unicode; then tl='┏'; tr='┓'; bl='┗'; br='┛'; h='━'; v='┃'; else tl='+'; tr='+'; bl='+'; br='+'; h='-'; v='|'; fi
+    printf -v bar '%*s' $((w + 2)) ''; bar="${bar// /$h}"
+    printf '%s%s%s%s%s\n' "${C_TITLE:-}" "$tl" "$bar" "$tr" "${C_OFF:-}"
+    for i in "${!P[@]}"; do
+      n=$((w - ${#P[i]}))
+      printf '%s%s%s %s%*s %s%s%s\n' "${C_TITLE:-}" "$v" "${C_OFF:-}" "${S[i]}" "$n" "" "${C_TITLE:-}" "$v" "${C_OFF:-}"
+    done
+    printf '%s%s%s%s%s\n' "${C_TITLE:-}" "$bl" "$bar" "$br" "${C_OFF:-}"
+  else
+    printf -v rule '%*s' $((cols < 58 ? cols : 58)) ''; rule="${rule// /=}"
+    printf '%s\n' "$rule"
+    for i in "${!P[@]}"; do if [[ -z ${P[i]} ]]; then echo; else printf '  %s\n' "${S[i]}"; fi; done
+    printf '%s\n' "$rule"
+  fi
+}
 
 # ---- pure functions (no side effects; tested in test/install-test.sh) --------
 
@@ -224,14 +272,17 @@ state_get() { # state_get FILE KEY
 
 # --- generated files ---
 # render_caddyfile PROFILE FQDN IPS EMAIL: the edge proxy's bootstrap file. It
-# holds only https sites, so Caddy adapts it to one server; the panel adds the
-# http and IP routes (the public IP's redirect, the LAN addresses) through the
-# admin API after its first start, and folds any other server into the same one.
-#   vps : FQDN = the https name.
-#   home: FQDN = tend.local.
-# IPS is accepted for callers' sake and unused: no IP is written here.
+# holds the https site; the panel adds the http and IP routes (the public IP's
+# redirect, the LAN addresses) through the admin API after its first start, and
+# folds any other server (the plain-http site below) into its own.
+#   vps : FQDN = the https name; IPS = the public IPv4. When known, plain http on
+#         that bare IP is redirected to the https name (308, the panel's own
+#         status) so the first minutes after install, before the panel's first
+#         successful edge sync, do not answer Caddy's generic redirect to
+#         https://<ip>/ (no certificate exists for it).
+#   home: FQDN = tend.local. IPS is unused: no IP is written here.
 render_caddyfile() {
-  local profile="$1" fqdn="$2" email="${4:-}"
+  local profile="$1" fqdn="$2" ips="${3:-}" email="${4:-}"
   printf '# Generated by the Tend installer. The panel replaces these routes through the admin API.\n'
   # shellcheck disable=SC2016  # {$VAR} is Caddy's own placeholder
   printf '{\n\tadmin {$TEND_CADDY_CONTROL_IP}:2019\n\tskip_install_trust\n'
@@ -239,6 +290,7 @@ render_caddyfile() {
   printf '}\n\n(panel) {\n\treverse_proxy %s:8787 {\n\t\tflush_interval -1\n\t}\n\tencode gzip\n}\n\n' "$PANEL_CONTROL_IP"
   if [[ $profile == vps ]]; then
     printf '%s {\n\timport panel\n}\n' "$fqdn"
+    if is_ipv4 "$ips"; then printf '\nhttp://%s {\n\tredir https://%s{uri} 308\n}\n' "$ips" "$fqdn"; fi
   else
     printf 'https://%s {\n\ttls internal\n\timport panel\n}\n' "$fqdn"
   fi
@@ -436,8 +488,11 @@ EOF
 # render_helper: /usr/local/bin/tend, the day-two command.
 render_helper() {
   printf '#!/usr/bin/env bash\n# Generated by the Tend installer.\nINSTALL_DIR=%q\n' "$INSTALL_DIR"
+  declare -f ui_cols ui_unicode ui_box
   cat << 'EOF'
 set -euo pipefail
+C_TITLE=""; C_OFF=""
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then C_TITLE=$'\033[1;32m'; C_OFF=$'\033[0m'; fi
 STATE="$INSTALL_DIR/.tend-install.json"
 sget() { local l; l="$(grep -E "^  \"$1\": " "$STATE" 2> /dev/null | head -1)" || return 0; l="${l#*: }"; l="${l%,}"; l="${l#\"}"; printf '%s' "${l%\"}"; }
 [[ -f $STATE ]] || { echo "Tend is not installed here (no $STATE)." >&2; exit 1; }
@@ -504,6 +559,38 @@ setup_code() {
   else echo "The code was set with TEND_SETUP_CODE when Tend was installed; it is not stored. Re-run the installer without it to get a generated one." >&2; exit 1; fi
 }
 
+# `tend reset-admin`: the engine makes a one-time link; this draws it in the same
+# box as the end of the install. Its own words (no account yet, several admins,
+# too many links) and exit status pass through untouched.
+reset_admin() {
+  local out rc=0 link="" rpath="" account="" two="" line tokens="Other sign-ins stop working." arg
+  if ! healthy; then echo "The panel is not running. Try: sudo tend status" >&2; exit 1; fi
+  if ! docker exec tend-host test -e /usr/local/share/tend/cli-v2 > /dev/null 2>&1; then
+    echo "This version of Tend cannot do that yet. Update first: sudo tend update" >&2; exit 1
+  fi
+  out="$(docker exec tend-host tend reset-admin "$@")" || rc=$?
+  if ((rc != 0)); then [[ -z $out ]] || printf '%s\n' "$out"; exit "$rc"; fi
+  while IFS= read -r line; do
+    case "$line" in
+      "Reset link: "*) link="${line#Reset link: }" ;;
+      "Reset path: "*) rpath="${line#Reset path: }" ;;
+      "Account: "*) account="${line#Account: }" ;;
+      "Two-step sign-in: "*) two="${line#Two-step sign-in: }" ;;
+    esac
+  done <<< "$out"
+  if [[ -z $link && -z $rpath ]]; then printf '%s\n' "$out"; return 0; fi
+  for arg in "$@"; do [[ $arg != --revoke-tokens ]] || tokens="Other sign-ins and API tokens stop working."; done
+  local -a rows=("")
+  rows+=("1. Open this link in a browser." "   It works once, for 15 minutes:")
+  if [[ -n $link ]]; then rows+=("$link"); else rows+=("Open your Tend address and add this to the end:" "$rpath"); fi
+  rows+=("" "2. Choose a new password, then sign in.")
+  if [[ $two == reset ]]; then rows+=("Two-step sign-in was reset: Tend will set it up again.")
+  else rows+=("Two-step sign-in stays on: keep your phone ready."); fi
+  rows+=("$tokens")
+  echo
+  ui_box "Password reset for ${account:-the administrator}" "${rows[@]}"
+}
+
 uninstall() {
   local purge=0 ans
   [[ ${1:-} != --purge ]] || purge=1
@@ -520,6 +607,7 @@ uninstall() {
   [[ ! -x /usr/local/lib/tend/lan-firewall.sh ]] || /usr/local/lib/tend/lan-firewall.sh remove || true
   rm -f /etc/systemd/system/tend-lan-firewall.service; systemctl daemon-reload 2> /dev/null || true
   rm -rf /usr/local/lib/tend
+  rm -f /etc/update-motd.d/60-tend /etc/profile.d/tend-claim.sh
   if ((purge)); then rm -rf "$DATA_DIR"; fi
   rm -rf "$INSTALL_DIR"
   echo "Tend is removed. Docker, the firewall rules for SSH and any apps the panel deployed were left alone."
@@ -533,6 +621,7 @@ case "${1:-help}" in
   addresses) addresses ;;
   address-reset) address_reset ;;
   address) shift; address_cmd "$@" ;;
+  reset-admin) shift; reset_admin "$@" ;;
   logs) shift; dc logs "$@" ;;
   update) shift; curl -fsSL "${TEND_INSTALL_BASE:-https://get.tend.host}/install.sh" | TEND_CHANNEL="$(sget channel)" bash -s -- "$@" ;;
   uninstall) shift; uninstall "${1:-}" ;;
@@ -544,6 +633,7 @@ usage: sudo tend <command>
   address --reset     go back to the address Tend was installed with
   setup-code          show the first-run setup code (while no account exists)
   setup-code --new    make a new one; the old code stops working
+  reset-admin         make a one-time link to set a new admin password
   update              install the newest signed release
   logs [args]         container logs (docker compose logs)
   uninstall           remove Tend, keep its data
@@ -573,6 +663,235 @@ ask() { # ask PROMPT DEFAULT(Y|N): returns 0 for yes
   read -r ans < /dev/tty || ans=""
   case "${ans,,}" in y | yes) return 0 ;; n | no) return 1 ;; *) [[ $d == Y ]] ;; esac
 }
+tty_line() { local l=""; read -r l < /dev/tty || true; printf '%s' "$l"; } # one line typed on the terminal
+
+# ---- who holds ports 80 and 443 -----------------------------------------------
+
+PROC_ROOT="${PROC_ROOT:-/proc}"
+
+# parse_ss_users LINE: "name pid" of the first process on an `ss -ltnp` line.
+parse_ss_users() {
+  local re='users:\(\("([^"]*)",pid=([0-9]+)'
+  [[ $1 =~ $re ]] || return 1
+  printf '%s %s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+# unit_of_pid PID: the systemd service a process runs in (from its cgroup).
+unit_of_pid() {
+  local f="$PROC_ROOT/$1/cgroup" line part unit=""
+  local -a parts
+  [[ -r $f ]] || return 1
+  while IFS= read -r line; do
+    line="${line#*:*:}"
+    IFS=/ read -r -a parts <<< "$line"
+    for part in "${parts[@]}"; do [[ $part != *.service ]] || unit="$part"; done
+  done < "$f"
+  [[ -n $unit ]] || return 1
+  printf '%s' "$unit"
+}
+# container_of_pid PID: the 64-hex container id a process runs in, if any.
+container_of_pid() {
+  local f="$PROC_ROOT/$1/cgroup" id
+  [[ -r $f ]] || return 1
+  id="$(grep -Eo '[0-9a-f]{64}' "$f" | head -1)" || id=""
+  [[ -n $id ]] || return 1
+  printf '%s' "$id"
+}
+# docker_ps_table: one line per running container: ID, name, image, ports (tab separated).
+docker_ps_table() {
+  command -v docker > /dev/null 2>&1 || return 0
+  docker ps --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Ports}}' 2> /dev/null || true
+}
+# docker_port_owners PORT: "name<TAB>image<TAB>id" of each container that publishes PORT.
+docker_port_owners() {
+  local id name image ports
+  while IFS=$'\t' read -r id name image ports; do
+    [[ $ports == *":$1->"* ]] || continue
+    printf '%s\t%s\t%s\n' "$name" "$image" "$id"
+  done < <(docker_ps_table)
+}
+# port_owner PORT: none | tend | container<TAB>NAME<TAB>IMAGE<TAB>ID |
+# service<TAB>UNIT<TAB>PROC | process<TAB>PROC<TAB>PID.
+port_owner() {
+  local port="$1" n img id line np name pid unit cid
+  while IFS=$'\t' read -r n img id; do
+    if [[ $n == tend-caddy ]]; then printf 'tend\n'; return 0; fi
+    printf 'container\t%s\t%s\t%s\n' "$n" "$img" "$id"; return 0
+  done < <(docker_port_owners "$port")
+  line="$(ss -ltnpH "sport = :$port" 2> /dev/null | head -1 || true)"
+  [[ -n $line ]] || { printf 'none\n'; return 0; }
+  np="$(parse_ss_users "$line" || true)"
+  [[ -n $np ]] || { printf 'process\tunknown\t-\n'; return 0; }
+  name="${np% *}"; pid="${np##* }"
+  if [[ $name != docker-proxy ]]; then
+    if cid="$(container_of_pid "$pid")"; then
+      while IFS=$'\t' read -r id n img _; do
+        [[ -n $id && $cid == "$id"* ]] || continue
+        if [[ $n == tend-caddy ]]; then printf 'tend\n'; else printf 'container\t%s\t%s\t%s\n' "$n" "$img" "$id"; fi
+        return 0
+      done < <(docker_ps_table)
+    fi
+    if unit="$(unit_of_pid "$pid")"; then printf 'service\t%s\t%s\n' "$unit" "$name"; return 0; fi
+  fi
+  printf 'process\t%s\t%s\n' "$name" "$pid"
+}
+# proxy_eligible KIND NAME IMAGE: only a web proxy may be stopped for the user.
+proxy_eligible() {
+  local img
+  case "$1" in
+    service) case "$2" in nginx.service | apache2.service | httpd.service | caddy.service | lighttpd.service | haproxy.service | traefik.service) return 0 ;; esac ;;
+    container)
+      img="${3%%@*}"; img="${img##*/}"; img="${img%%:*}"; img="${img,,}"
+      case "$img" in nginx* | traefik | caddy | haproxy | httpd | openresty | swag) return 0 ;; esac
+      ;;
+  esac
+  return 1
+}
+# other_panel: prints the name of another hosting panel on this machine (return 0), or returns 1.
+other_panel() {
+  local root="${FS_ROOT:-}" d id name image k hay
+  for d in cpanel:cPanel psa:Plesk hestia:HestiaCP CyberCP:CyberPanel; do
+    if [[ -d $root/usr/local/${d%%:*} ]]; then printf '%s' "${d#*:}"; return 0; fi
+  done
+  while IFS=$'\t' read -r id name image _; do
+    hay="${name,,} ${image,,}"
+    for k in coolify:Coolify caprover:CapRover captain-captain:CapRover dokploy:Dokploy easypanel:Easypanel runtipi:Runtipi; do
+      if [[ $hay == *"${k%%:*}"* ]]; then printf '%s' "${k#*:}"; return 0; fi
+    done
+  done < <(docker_ps_table)
+  return 1
+}
+# owner_text KIND A B: how the screen names a port owner.
+owner_text() {
+  case "$1" in
+    container) printf 'the container %s (%s)' "$2" "$3" ;;
+    service) printf 'the service %s (%s)' "$2" "$3" ;;
+    *) printf 'the program %s (process %s)' "$2" "$3" ;;
+  esac
+}
+# other_containers: "NAME (IMAGE)" of the running containers the takeover leaves alone.
+other_containers() {
+  local id name image ports t k a
+  while IFS=$'\t' read -r id name image ports; do
+    [[ -n $name && $name != tend-* ]] || continue
+    for t in "${TAKEOVER[@]}"; do
+      IFS=$'\t' read -r k a _ <<< "$t"
+      if [[ $k == container && $a == "$name" ]]; then continue 2; fi
+    done
+    printf '%s (%s)\n' "$name" "$image"
+  done < <(docker_ps_table)
+}
+
+# check_ports: in preflight. Free ports (or Tend's own proxy) pass; a web proxy is
+# queued in TAKEOVER (stopped later, by take_over_ports, once the stack is written);
+# anything else is refused in plain words.
+check_ports() {
+  local port o kind a b c line txt t seen k2 a2 oc n ans
+  local -a rows=()
+  TAKEOVER=()
+  for port in 80 443; do
+    o="$(port_owner "$port")"
+    IFS=$'\t' read -r kind a b c <<< "$o"
+    case $kind in none | tend) continue ;; esac
+    rows+=("$port"$'\t'"$o")
+  done
+  if ((${#rows[@]} == 0)); then c_ok "Ports 80 and 443 are free"; return 0; fi
+  for line in "${rows[@]}"; do
+    IFS=$'\t' read -r port kind a b c <<< "$line"
+    c_warn "Port $port: $(owner_text "$kind" "$a" "$b")"
+  done
+  if a="$(other_panel)"; then
+    die "This server runs $a, another hosting panel. Two panels cannot share ports 80 and 443. Start from a fresh server: use Rebuild in your provider's console (Debian 12 or Ubuntu 24.04), then run the installer again."
+  fi
+  for line in "${rows[@]}"; do
+    IFS=$'\t' read -r port kind a b c <<< "$line"
+    txt="$(owner_text "$kind" "$a" "$b")"
+    proxy_eligible "$kind" "$a" "$b" ||
+      die "${txt^} uses port $port. Tend needs ports 80 and 443. Tend only stops a web proxy (nginx, Apache, Caddy, Traefik, HAProxy) for you; move this one yourself, or start from a fresh server with your provider's Rebuild."
+    seen=0
+    for t in "${TAKEOVER[@]}"; do
+      IFS=$'\t' read -r k2 a2 _ <<< "$t"
+      [[ $k2 == "$kind" && $a2 == "$a" ]] && seen=1
+    done
+    ((seen)) || TAKEOVER+=("$kind"$'\t'"$a"$'\t'"$b"$'\t'"$c")
+  done
+  if [[ ${TAKE_OVER_PORTS:-0} == 1 ]]; then
+    for t in "${TAKEOVER[@]}"; do
+      IFS=$'\t' read -r kind a b c <<< "$t"
+      c_warn "$(owner_text "$kind" "$a" "$b") will be stopped (--take-over-ports), after Tend's files are written"
+    done
+    return 0
+  fi
+  if [[ ${ASSUME_YES:-0} == 1 ]] || ! tty_ok; then
+    IFS=$'\t' read -r port kind a b c <<< "${rows[0]}"
+    die "$(owner_text "$kind" "$a" "$b") uses port $port. Tend can stop it for you, but it needs your OK. Run the installer in a terminal to be guided, or add --take-over-ports to stop it without asking."
+  fi
+  echo
+  echo "    Tend can stop this web proxy for you."
+  echo "    Nothing is deleted: no container, file, setting or volume."
+  echo
+  echo "    Will be stopped and kept from starting at boot:"
+  for t in "${TAKEOVER[@]}"; do
+    IFS=$'\t' read -r kind a b c <<< "$t"
+    echo "      - $(owner_text "$kind" "$a" "$b")"
+  done
+  echo "    Keep running, untouched:"
+  oc="$(other_containers)"
+  if [[ -n $oc ]]; then while IFS= read -r line; do echo "      - container $line"; done <<< "$oc"
+  else echo "      (nothing else is running)"; fi
+  echo
+  echo "    Websites the old proxy served go offline"
+  echo "    until you add their domains in Tend."
+  n=0; [[ -z $oc ]] || n="$(wc -l <<< "$oc")"
+  ((n <= 5)) || { echo "    This server already runs many things."; echo "    A fresh server is often simpler: your provider's Rebuild."; }
+  printf '\n    Type yes to stop it, anything else to cancel: ' 2> /dev/null > /dev/tty || true
+  ans="$(tty_line)"
+  [[ $ans == yes ]] || die "Nothing was changed."
+}
+
+stop_failed() { # stop_failed NAME FILE
+  local m="Could not stop $1."
+  [[ ! -f $2 ]] || m+=" Whatever Tend already stopped can be started again with the commands in $2."
+  die "$m"
+}
+# take_over_ports: right before start_stack. Stops (never removes) what check_ports
+# queued, saves and prints the way back, then waits for the ports.
+take_over_ports() {
+  ((${#TAKEOVER[@]} > 0)) || return 0
+  local file="$INSTALL_DIR/ports-taken-over.txt" t kind a b c pol rc undo txt i busy still
+  c_step "Making room on ports 80 and 443"
+  mkdir -p "$INSTALL_DIR"
+  for t in "${TAKEOVER[@]}"; do
+    IFS=$'\t' read -r kind a b c <<< "$t"
+    txt="$(owner_text "$kind" "$a" "$b")"
+    if [[ $kind == service ]]; then
+      systemctl disable --now "$a" || stop_failed "$a" "$file"
+      undo="sudo systemctl enable --now $a"
+    else
+      pol="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$c" 2> /dev/null || true)"
+      [[ -n $pol ]] || pol=no
+      if [[ $pol == on-failure ]]; then
+        rc="$(docker inspect -f '{{.HostConfig.RestartPolicy.MaximumRetryCount}}' "$c" 2> /dev/null || true)"
+        [[ ! $rc =~ ^[1-9][0-9]*$ ]] || pol+=":$rc"
+      fi
+      docker update --restart=no "$c" > /dev/null || stop_failed "$a" "$file"
+      docker stop "$c" > /dev/null || stop_failed "$a" "$file"
+      undo="sudo docker stop tend-caddy && sudo docker update --restart=$pol $a && sudo docker start $a"
+    fi
+    c_warn "Stopped ${txt}. To undo:"
+    printf '        %s\n' "$undo"
+    printf '# %s  Tend stopped %s\n%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$txt" "$undo" >> "$file"
+    chmod 0644 "$file"
+    record "Stopped $txt (undo: $file)"
+  done
+  busy=1
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if [[ "$(port_owner 80)" == none && "$(port_owner 443)" == none ]]; then busy=0; break; fi
+    sleep 1
+  done
+  ((!busy)) || die "Ports 80 and 443 are still in use after stopping it. The way back is saved in $file."
+  still="$(other_containers | wc -l)"
+  c_ok "Ports 80 and 443 are free now. Still running, untouched: ${still// /} other container(s)."
+}
 
 # ---- steps ------------------------------------------------------------------
 
@@ -600,14 +919,7 @@ preflight() {
   disk="$(df -Pk "$([[ -d /var/lib/docker ]] && echo /var/lib/docker || echo /var/lib)" | awk 'NR==2 {print $4}')"
   disk_ok "$disk" || die "Tend needs 10 GB of free disk; this machine has $((disk / 1048576)) GB free."
   c_ok "Disk: $((disk / 1048576)) GB free"
-  local owner
-  for port in 80 443; do
-    owner="$(ss -ltnpH "sport = :$port" 2> /dev/null | grep -v 'docker-proxy' | head -1 || true)"
-    if [[ -n $owner ]] && ! docker ps --format '{{.Names}}' 2> /dev/null | grep -qx tend-caddy; then
-      die "Port $port is already in use by another program (${owner##*users:}). Stop it first, then run this again."
-    fi
-  done
-  c_ok "Ports 80 and 443 are free"
+  check_ports
   local code
   code="$(curl -s -o /dev/null -m 10 -w '%{http_code}' https://ghcr.io/v2/ 2> /dev/null || true)"
   [[ $code != 000 ]] || die "Cannot reach ghcr.io (where the Tend image is stored). Check this machine's internet and firewall."
@@ -860,6 +1172,7 @@ https_up() { curl -fsS -m 5 --resolve "$PANEL_FQDN:443:127.0.0.1" "https://$PANE
 
 rollback() {
   c_err "The new version did not start. Going back to the previous one."
+  if ((${#TAKEOVER[@]} > 0)); then c_warn "The web proxy Tend stopped is still stopped. To start it again, use the commands in $INSTALL_DIR/ports-taken-over.txt"; fi
   if [[ -f $INSTALL_DIR/docker-compose.yml.prev ]]; then
     cp -f "$INSTALL_DIR/docker-compose.yml.prev" "$INSTALL_DIR/docker-compose.yml"
     [[ ! -f $INSTALL_DIR/.env.prev ]] || cp -f "$INSTALL_DIR/.env.prev" "$INSTALL_DIR/.env"
@@ -939,41 +1252,131 @@ addresses_text() {
   fi
 }
 
+# panel_url: the address the final screen sends the user to.
+panel_url() {
+  if [[ $PROFILE == home ]]; then printf 'http://%s' "${LAN_IP:-${LOCAL_NAME}.local}"; else printf 'https://%s' "$(panel_host_now)"; fi
+}
+
+# final_box: the last thing the installer prints (the code or the way back is the
+# last thing on screen). The wording is part of the product: plain words, numbered
+# steps, nothing that scrolls away.
+final_box() {
+  local url="${1:-$(panel_url)}" words line n
+  local -a nwords
+  local -a rows=()
+  echo
+  if [[ ${ADMIN_EXISTS:-0} == 1 ]]; then
+    rows=("" "Open:  $url" "Sign in with your account." "Forgot the password?  sudo tend reset-admin")
+    ui_box "Tend is ready." "${rows[@]}"
+    return 0
+  fi
+  rows=("" "1. Open this address in a browser:" "     $url")
+  if [[ -n ${SETUP_CODE:-} ]]; then
+    rows+=("2. Type this setup code:  ${SETUP_CODE}"$'\t'"2. Type this setup code:  ${C_CODE}${SETUP_CODE}${C_OFF}" "3. Make your account. Keep this code until then.")
+  elif [[ -n ${SETUP_NOTE:-} ]]; then
+    # The note wraps at 50 characters on word boundaries, under the number.
+    words=""; n=0
+    read -r -a nwords <<< "$SETUP_NOTE"
+    for line in "${nwords[@]}"; do
+      if ((${#words} + ${#line} + 1 > 50)) && [[ -n $words ]]; then
+        if ((n == 0)); then rows+=("2. $words"); else rows+=("   $words"); fi
+        n=$((n + 1)); words="$line"
+      else words="${words:+$words }$line"; fi
+    done
+    if ((n == 0)); then rows+=("2. $words"); else rows+=("   $words"); fi
+    rows+=("3. Make your account.")
+  else
+    rows+=("2. Show the setup code:  sudo tend setup-code" "3. Make your account.")
+  fi
+  rows+=("" "Lost the code?  sudo tend setup-code" "Want your own address, like panel.example.com?" "Set it in Tend after you sign in.")
+  ui_box "Tend is ready. Finish in 3 steps:" "${rows[@]}"
+}
+
+# account_ready: has the first account been made? (the panel answers first_run false)
+account_ready() {
+  docker exec tend-host curl -fsS http://127.0.0.1:8787/api/auth/setup-status 2> /dev/null | grep -q '"first_run":[[:space:]]*false'
+}
+
+# wait_for_account: after the box, on a terminal only. Keeps the box on screen,
+# says so when the account exists, and ends on Enter or after 30 minutes.
+# Automation (--yes, no terminal) never waits.
+wait_for_account() {
+  [[ ${ASSUME_YES:-0} == 0 && -n ${SETUP_CODE:-} ]] && tty_ok || return 0
+  release_update_lock
+  printf '\nWaiting for you to make your account... (press Enter to stop waiting)\n'
+  local deadline=$((SECONDS + 1800)) rc
+  while ((SECONDS < deadline)); do
+    if account_ready; then printf 'Done: your account is ready. You can close this window.\n'; return 0; fi
+    rc=0; read -r -t 3 _ < /dev/tty || rc=$?
+    ((rc > 128)) || return 0
+  done
+  return 0
+}
+
+# install_claim_banner: a login reminder that exists only while nobody has made
+# the first account. It tests that the engine's code file exists and never reads
+# it, so the code itself is never on disk outside that file.
+install_claim_banner() {
+  local motd_dir="${MOTD_DIR:-/etc/update-motd.d}" prof_dir="${PROFILE_D:-/etc/profile.d}" url file code_q
+  url="$(panel_url)"
+  printf -v code_q '%q' "$DATA_DIR/first-run-setup-code"
+  rm -f "$motd_dir/60-tend" "$prof_dir/tend-claim.sh"
+  [[ ${ADMIN_EXISTS:-0} != 1 ]] || return 0
+  if [[ -d $motd_dir ]]; then
+    file="$motd_dir/60-tend"
+    {
+      printf '#!/bin/sh\n# Generated by the Tend installer. Prints only while no account exists.\n'
+      printf '[ -e %s ] || exit 0\n' "$code_q"
+      printf 'echo "Tend is waiting for its first account."\n'
+      printf 'echo "Open %s and type the setup code."\n' "$url"
+      printf 'echo "Show the code: sudo tend setup-code"\n'
+    } > "$file"
+    chmod 0755 "$file"
+  else
+    mkdir -p "$prof_dir"
+    file="$prof_dir/tend-claim.sh"
+    {
+      printf '# Generated by the Tend installer. Prints only while no account exists.\n'
+      printf 'case $- in *i*) ;; *) return 0 ;; esac\n'
+      printf '[ -e %s ] || return 0\n' "$code_q"
+      printf 'echo "Tend is waiting for its first account."\n'
+      printf 'echo "Open %s and type the setup code."\n' "$url"
+      printf 'echo "Show the code: sudo tend setup-code"\n'
+    } > "$file"
+    chmod 0644 "$file"
+  fi
+}
+
+# qr_ok: a QR code only on a terminal that can show it (a log file gets none).
+qr_ok() { [[ -t 1 ]] && command -v qrencode > /dev/null 2>&1; }
+
 summary() {
   local url qr
-  if [[ $PROFILE == home ]]; then url="http://${LAN_IP:-${LOCAL_NAME}.local}"; else url="https://$(panel_host_now)"; fi
-  echo; echo "============================================================"
-  printf '  %sTend is ready.%s\n' "$C_BOLD" "$C_OFF"
-  echo "============================================================"; echo
-  echo "  Open Tend in a browser:"; addresses_text; echo
-  if [[ -n $SETUP_CODE ]]; then
-    printf '  Setup code: %s%s%s\n' "$C_BOLD" "$SETUP_CODE" "$C_OFF"
-    echo "  You will type it on the first screen to create your account."
-    if command -v qrencode > /dev/null 2>&1; then
-      qr="${url}/#setup=${SETUP_CODE}"
-      echo "  Or scan this with your phone:"; qrencode -t ansiutf8 "$qr" | sed 's/^/    /' || true
-    fi
-    echo "  Lost the code?   sudo tend setup-code"
-  elif [[ $ADMIN_EXISTS == 1 ]]; then
-    echo "  Tend already has an administrator on this server, so no setup code is needed."
-  elif [[ -n ${SETUP_NOTE:-} ]]; then
-    echo "  $SETUP_NOTE"
-  fi
-  echo "  Remove Tend:     sudo tend uninstall"; echo
+  url="$(panel_url)"
+  echo
   if [[ ${#APPLIED[@]} -gt 0 ]]; then echo "  What was set up:"; printf '    - %s\n' "${APPLIED[@]}"; echo; fi
   if [[ $PROFILE == home ]]; then
-    echo "  Tip: give this machine a fixed address in your router so $LAN_IP does not change."
+    echo "  Tip: in your router, give this machine a fixed address,"
+    echo "  so $LAN_IP does not change."
   elif [[ ${CLOUD:-0} == 1 ]]; then
-    echo "  Your hosting provider has its own firewall: allow ports 80 and 443 there if the page does not open."
+    echo "  Your hosting provider has its own firewall."
+    echo "  If the page does not open, allow ports 80 and 443 there."
   fi
   [[ ! -f /var/run/reboot-required ]] || echo "  A reboot is queued for system updates; do it when convenient."
-  echo "  Other commands: sudo tend status | update | logs | addresses"; echo
+  echo "  Other commands: sudo tend status | update | logs | addresses | uninstall"
+  if [[ -n $SETUP_CODE ]] && qr_ok; then
+    qr="${url}/#setup=${SETUP_CODE}"
+    echo; echo "  Or scan this with your phone; it opens the page with the code filled in:"
+    qrencode -t ansiutf8 "$qr" | sed 's/^/    /' || true
+  fi
+  final_box "$url"
+  wait_for_account
 }
 
 usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }
 
 main() {
-  ASSUME_YES=0; ALLOW_DOWNGRADE=0; USE_EXISTING_DOCKER=0; CLOUD=0
+  ASSUME_YES=0; ALLOW_DOWNGRADE=0; USE_EXISTING_DOCKER=0; CLOUD=0; TAKE_OVER_PORTS=0
   SKIP_HARDENING="${SKIP_HARDENING:-0}"; SKIP_SYSTEM_UPDATE="${SKIP_SYSTEM_UPDATE:-0}"
   LOCAL_MODE="${TEND_LOCAL_MODE:-}"; LOCAL_NAME="${TEND_LOCAL_NAME:-tend}"; LOCAL_NAME_GIVEN=0
   [[ -z ${TEND_LOCAL_NAME:-} ]] || LOCAL_NAME_GIVEN=1
@@ -983,7 +1386,7 @@ main() {
   for arg in "$@"; do
     case "$arg" in
       --local) LOCAL_MODE=1 ;; --public) LOCAL_MODE=0 ;; --local-name=*) LOCAL_NAME="${arg#*=}"; LOCAL_NAME_GIVEN=1 ;;
-      --allow-downgrade) ALLOW_DOWNGRADE=1 ;; --use-existing-docker) USE_EXISTING_DOCKER=1 ;; -y | --yes) ASSUME_YES=1 ;;
+      --allow-downgrade) ALLOW_DOWNGRADE=1 ;; --use-existing-docker) USE_EXISTING_DOCKER=1 ;; -y | --yes) ASSUME_YES=1 ;; --take-over-ports) TAKE_OVER_PORTS=1 ;;
       -h | --help) usage; exit 0 ;;
       *) echo "Unknown option: $arg (see --help)" >&2; exit 2 ;;
     esac
@@ -1038,7 +1441,7 @@ main() {
   # Same version, same digest, same profile and running: nothing to do.
   if [[ -n $installed && $installed == "$TEND_M_VERSION" && -n $old_profile && $old_profile == "$PROFILE" ]] &&
     [[ "$(state_get "$state" image_digest || true)" == "$TEND_M_IMAGE_DIGEST" ]] && panel_healthy > /dev/null 2>&1; then
-    c_ok "Tend $installed is up to date and running."; addresses_text; exit 0
+    c_ok "Tend $installed is up to date and running."; read_setup_code; final_box; exit 0
   fi
 
   if [[ $PROFILE == vps ]]; then update_system; fi
@@ -1047,6 +1450,7 @@ main() {
   install_docker
   if [[ $PROFILE == home ]]; then install_lan_firewall; else drop_home_leftovers; fi
   write_stack
+  take_over_ports
   start_stack
   c_step "Waiting for Tend to start (up to 2 minutes)"
   if ! wait_for 120 panel_healthy; then echo; rollback; die "Tend did not answer within 2 minutes. Look at: cd $INSTALL_DIR && docker compose logs --tail=80"; fi
@@ -1055,6 +1459,7 @@ main() {
   render_state "$TEND_M_VERSION" "$TEND_M_IMAGE_DIGEST" "${TEND_CHANNEL:-stable}" "$PROFILE" "${PANEL_FQDN}" "$([[ $PROFILE == home ]] && echo "${LOCAL_NAME}.local")" "$PUBLIC_IP" "$LAN_IP" "$TEND_M_IMAGE" > "$state"
   render_helper > "$HELPER"; chmod 0755 "$HELPER"
   read_setup_code
+  install_claim_banner
   summary
 }
 
