@@ -1,0 +1,118 @@
+name: Sign and publish the install channels
+
+# Source of truth: deploy/tend-install/ in the panel repository
+# (docs/agent/installer.md, "Publishing a release"). Replace this file from
+# there; do not edit it here.
+#
+# Every hour: look for new panel versions in the public image package, and for
+# manifests due a re-sign (older than seven days; they live thirty). Nothing to
+# do ends the run after the plan. Otherwise the `sign` job waits for a reviewer
+# of the `release` environment, which alone holds TEND_PANEL_RELEASE_KEY, and
+# then signs, commits site/ and refreshes the GitHub releases stage 0 falls
+# back to. Read the plan job's summary before approving.
+#
+# Manual run with dry_run: plans and signs with a throwaway key generated in the
+# run, verifies the result exactly as install.sh would, publishes nothing, and
+# never touches the release environment.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Plan and sign with a throwaway key; publish nothing"
+        type: boolean
+        default: false
+      force_resign:
+        description: "Re-sign both channels now even if they are not due"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-install-channels
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    outputs:
+      sign: ${{ steps.plan.outputs.sign }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Plan from the public package
+        id: plan
+        env:
+          FORCE: ${{ (inputs.force_resign || inputs.dry_run) && '--force-resign' || '' }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          scripts/tend-install.sh plan --site site --out "$RUNNER_TEMP/plan" $FORCE 2>&1 | tee "$RUNNER_TEMP/plan.log"
+          sign="$(sed -n 's/^sign=//p' "$RUNNER_TEMP/plan/plan.env")"
+          echo "sign=$sign" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Install channel plan"
+            echo '```'
+            cat "$RUNNER_TEMP/plan.log"
+            echo '```'
+            if [ "$sign" = 1 ]; then echo "The sign job waits for approval of the release environment."; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: ${{ runner.temp }}/plan
+          retention-days: 7
+
+  sign:
+    name: Sign and publish
+    needs: plan
+    if: needs.plan.outputs.sign == '1' && !inputs.dry_run && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: ${{ runner.temp }}/plan
+      - name: Sign the channel manifests and install.sh
+        env:
+          TEND_PANEL_RELEASE_KEY: ${{ secrets.TEND_PANEL_RELEASE_KEY }}
+        run: scripts/tend-install.sh sign --site site --plan "$RUNNER_TEMP/plan"
+      - name: Commit site/ and refresh the releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/tend-install.sh publish --site site --plan "$RUNNER_TEMP/plan"
+
+  dry_run:
+    name: Dry run (throwaway key)
+    needs: plan
+    if: inputs.dry_run
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: ${{ runner.temp }}/plan
+      - name: Sign with a throwaway key and verify as stage 0 would
+        run: |
+          set -euo pipefail
+          umask 077
+          openssl genpkey -algorithm ed25519 -out "$RUNNER_TEMP/throwaway.key"
+          TEND_INSTALL_DRY_RUN_SPKI="$(openssl pkey -in "$RUNNER_TEMP/throwaway.key" -pubout -outform DER | base64 -w0)"
+          TEND_PANEL_RELEASE_KEY="$(cat "$RUNNER_TEMP/throwaway.key")"
+          export TEND_INSTALL_DRY_RUN_SPKI TEND_PANEL_RELEASE_KEY
+          cp -r site "$RUNNER_TEMP/site" 2> /dev/null || mkdir -p "$RUNNER_TEMP/site"
+          scripts/tend-install.sh sign --site "$RUNNER_TEMP/site" --plan "$RUNNER_TEMP/plan"
+          ls -l "$RUNNER_TEMP/site" "$RUNNER_TEMP/site/v1"
