@@ -47,14 +47,23 @@ instead of `tend-install-script-v1`. Also check its `expires_at` and its
 
 ## How a release gets here
 
-1. A panel release tag is built for `linux/amd64` and `linux/arm64`. The image is
-   copied by digest to the public `ghcr.io/tend-stack/tend-host`.
-2. Every hour, `publish.yml` reads that package anonymously. Stable takes the
-   highest version without a prerelease part, and beta takes the highest version
-   of all. A beta tag therefore never changes `stable.json`, and a channel never
-   moves to a lower version.
+1. A panel release tag, signed with the maintainer's SSH key, is built for `linux/amd64`
+   and `linux/arm64` by the panel's GitHub workflow, which also publishes a proof: the
+   signed tag object and a Sigstore signature, made by that workflow run, over the
+   statement {version, revision, image digest}.
+2. Every 15 minutes, `publish.yml` copies a version and its proof to the public
+   `ghcr.io/tend-stack/tend-host` by digest, but only if the proof verifies: the tag
+   signature checks against `release-tag-signers` (the maintainer's pinned key), and
+   the Sigstore certificate names the panel's release workflow, that tag and that
+   commit. Then it reads that package anonymously. Stable takes the highest version
+   without a prerelease part, and beta takes the highest version of all. A beta tag
+   therefore never changes `stable.json`, and a channel never moves to a lower version.
 3. The version, the revision, stage 1, `install.sh` and the public key are all
    read from the image at that digest.
-4. Signing happens only in the `release` environment, after a maintainer approves
-   it. Manifests are re-signed every week, so a valid one is never more than
-   about seven days old.
+4. Nobody approves a run; the signed tag is the approval. The `sign` job checks the
+   proof again and signs only in the `release` environment. Manifests are re-signed
+   every week, so a valid one is never more than about seven days old. A release
+   whose proof does not verify is refused and never blocks that re-sign.
+5. A refusal, a failed run, or a change to the code on `main` opens a GitHub issue
+   in this repository (one per title; no repeat comments). `site/` is the only part
+   of `main` the workflow changes, and it pushes with a deploy key.

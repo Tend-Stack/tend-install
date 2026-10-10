@@ -1,0 +1,37 @@
+name: Alert on a code change
+
+# Source of truth: deploy/tend-install/ in the panel repository
+# (docs/agent/installer.md, "Publishing a release"). Replace this file from
+# there; do not edit it here.
+#
+# Code on main (the scripts, the workflows, the pinned tag signer) changes only
+# when the operator syncs it from the panel repository, and the signing key
+# runs whatever is on main. So every push to main that touches anything outside
+# site/ opens an issue naming the commit: expected after a sync, an incident
+# otherwise. The workflow bot's own pushes only touch site/ and are ignored.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "site/**"
+
+permissions:
+  contents: read
+
+jobs:
+  alert:
+    name: Open an issue
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Open one issue for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: scripts/tend-install.sh alert --code-change "$GITHUB_SHA"

@@ -4,24 +4,41 @@ name: Sign and publish the install channels
 # (docs/agent/installer.md, "Publishing a release"). Replace this file from
 # there; do not edit it here.
 #
-# Every hour: look for new panel versions in the public image package, and for
-# manifests due a re-sign (older than seven days; they live thirty). Nothing to
-# do ends the run after the plan. Otherwise the `sign` job waits for a reviewer
-# of the `release` environment, which alone holds TEND_PANEL_RELEASE_KEY, and
-# then signs, commits site/ and refreshes the GitHub releases stage 0 falls
-# back to. Read the plan job's summary before approving.
+# Every 15 minutes:
+#   copy  copies a release and its proof from the private panel image package
+#         to the public one, proof first, and only when the proof verifies. It
+#         uses this repository's own GITHUB_TOKEN (packages: write) and never
+#         sees the release key.
+#   plan  reads the public package anonymously, verifies each new version's
+#         proof, and lists what to sign (new versions, and manifests older than
+#         seven days; they live thirty). Nothing to do ends the run here.
+#   sign  verifies the proof again, signs with TEND_PANEL_RELEASE_KEY, and
+#         pushes site/ with the deploy key. It names the environment `release`
+#         (branch `main` only), which alone holds both secrets. It works with
+#         the required reviewer present (the run then waits, as during the
+#         cutover) and without it.
+#   alert opens one GitHub issue per refusal or failure (never a comment).
 #
-# Manual run with dry_run: plans and signs with a throwaway key generated in the
-# run, verifies the result exactly as install.sh would, publishes nothing, and
-# never touches the release environment.
+# No human approves a run. The operator's SSH-signed vX.Y.Z tag is the
+# approval: a version is copied and signed only with the proof release.yml
+# pushed (signed tag object checked against release-tag-signers, a Sigstore
+# certificate for wilkinsantana/tend.host's release.yml run on that tag, the
+# statement {version, revision, image digest} equal to the image). See
+# scripts/tend-install.sh and docs/strategy/auto-channel-signing-plan.md.
+# A refused release or a failed copy never blocks the re-sign of what is
+# published.
+#
+# Manual run with dry_run: no copy; plans and signs with a throwaway key
+# generated in the run, verifies the result exactly as install.sh would,
+# publishes nothing, and never touches the release environment.
 
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "2,17,32,47 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Plan and sign with a throwaway key; publish nothing"
+        description: "Plan and sign with a throwaway key; copy and publish nothing"
         type: boolean
         default: false
       force_resign:
@@ -37,15 +54,82 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  copy:
+    name: Copy proven releases to the public package
+    if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    # The environment holds TEND_PRIVATE_PACKAGES_READ only when the package grant
+    # for GITHUB_TOKEN could not be made (plan, D5); without that secret the
+    # token is used for both registries.
+    environment: image-copy
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      refused: ${{ steps.copy.outputs.refused }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.4.1
+      - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+        with:
+          version: 1.2.3
+      - name: Copy
+        id: copy
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          READ_TOKEN: ${{ secrets.TEND_PRIVATE_PACKAGES_READ }}
+        run: |
+          set -euo pipefail
+          umask 077
+          # Docker config files; tokens are shell variables here, never arguments.
+          docker_config() { printf '{"auths":{"ghcr.io":{"auth":"%s"}}}\n' "$(printf '%s:%s' "$1" "$2" | base64 -w0)"; }
+          docker_config "$GITHUB_ACTOR" "$GITHUB_TOKEN" > "$RUNNER_TEMP/to.json"
+          if [ -n "${READ_TOKEN:-}" ]; then
+            docker_config wilkinsantana "$READ_TOKEN" > "$RUNNER_TEMP/from.json"
+          else
+            docker_config "$GITHUB_ACTOR" "$GITHUB_TOKEN" > "$RUNNER_TEMP/from.json"
+          fi
+          export TEND_COPY_TO_CONFIG="$RUNNER_TEMP/to.json" TEND_COPY_FROM_CONFIG="$RUNNER_TEMP/from.json"
+          unset GITHUB_TOKEN READ_TOKEN
+          rc=0
+          scripts/tend-install.sh copy --out "$RUNNER_TEMP/copy" 2>&1 | tee "$RUNNER_TEMP/copy.log" || rc=$?
+          rm -f "$RUNNER_TEMP/to.json" "$RUNNER_TEMP/from.json"
+          if [ -s "$RUNNER_TEMP/copy/copy-refusals.tsv" ]; then echo "refused=1" >> "$GITHUB_OUTPUT"; else echo "refused=0" >> "$GITHUB_OUTPUT"; fi
+          {
+            echo "### Image copy"
+            echo '```'
+            cat "$RUNNER_TEMP/copy.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: copy
+          path: ${{ runner.temp }}/copy/copy-refusals.tsv
+          if-no-files-found: ignore
+          retention-days: 7
+
   plan:
     name: Plan
+    needs: copy
+    # A copy that refused or failed never blocks a re-sign.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     outputs:
       sign: ${{ steps.plan.outputs.sign }}
+      refused: ${{ steps.plan.outputs.refused }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.4.1
       - name: Plan from the public package
         id: plan
         env:
@@ -55,15 +139,17 @@ jobs:
           # shellcheck disable=SC2086
           scripts/tend-install.sh plan --site site --out "$RUNNER_TEMP/plan" $FORCE 2>&1 | tee "$RUNNER_TEMP/plan.log"
           sign="$(sed -n 's/^sign=//p' "$RUNNER_TEMP/plan/plan.env")"
+          refused="$(sed -n 's/^refused=//p' "$RUNNER_TEMP/plan/plan.env")"
           echo "sign=$sign" >> "$GITHUB_OUTPUT"
+          echo "refused=$refused" >> "$GITHUB_OUTPUT"
           {
             echo "### Install channel plan"
             echo '```'
             cat "$RUNNER_TEMP/plan.log"
             echo '```'
-            if [ "$sign" = 1 ]; then echo "The sign job waits for approval of the release environment."; fi
+            if [ "$refused" = 1 ]; then echo "A release was refused: the alert job opens an issue."; fi
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: plan
           path: ${{ runner.temp }}/plan
@@ -78,8 +164,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      # The deploy key is what may push to main past the ruleset (a raw push with any
+      # other credential is refused). Until the cutover the secret is unset and the
+      # checkout uses the workflow token.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ssh-key: ${{ secrets.TEND_INSTALL_DEPLOY_KEY }}
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.4.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: plan
           path: ${{ runner.temp }}/plan
@@ -92,16 +186,62 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: scripts/tend-install.sh publish --site site --plan "$RUNNER_TEMP/plan"
 
+  alert:
+    name: Open issues for refusals and failures
+    needs: [copy, plan, sign]
+    if: >-
+      always() && !inputs.dry_run && github.ref == 'refs/heads/main' &&
+      (needs.copy.outputs.refused == '1' || needs.plan.outputs.refused == '1' ||
+      needs.copy.result == 'failure' || needs.plan.result == 'failure' || needs.sign.result == 'failure')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # A failed job uploads nothing; the alert then has only the failure to report.
+      # Both artifacts land in one directory: refusals.tsv (plan) and copy-refusals.tsv (copy).
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        continue-on-error: true
+        with:
+          name: plan
+          path: ${{ runner.temp }}/plan
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        continue-on-error: true
+        with:
+          name: copy
+          path: ${{ runner.temp }}/plan
+      - name: Open the issues (one per title; no comments)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COPY_RESULT: ${{ needs.copy.result }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          SIGN_RESULT: ${{ needs.sign.result }}
+        run: |
+          set -euo pipefail
+          failed=""
+          for r in "$COPY_RESULT" "$PLAN_RESULT" "$SIGN_RESULT"; do
+            if [ "$r" = failure ]; then failed="--failed"; fi
+          done
+          # shellcheck disable=SC2086
+          scripts/tend-install.sh alert --plan "$RUNNER_TEMP/plan" $failed
+
   dry_run:
     name: Dry run (throwaway key)
     needs: plan
     if: inputs.dry_run
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.4.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: plan
           path: ${{ runner.temp }}/plan

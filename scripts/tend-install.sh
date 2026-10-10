@@ -5,9 +5,11 @@
 # (docs/agent/installer.md, "Publishing a release"); this repository's copy is
 # replaced from there, never edited here.
 #
+#   tend-install.sh copy    --out copy                                   # oras; GITHUB_TOKEN (packages: write)
 #   tend-install.sh plan    --site site --out plan [--now <unix>] [--force-resign]
 #   tend-install.sh sign    --site site --plan plan [--now <unix>]      # needs TEND_PANEL_RELEASE_KEY
 #   tend-install.sh publish --site site --plan plan                      # git + gh, GITHUB_TOKEN
+#   tend-install.sh alert   --plan plan [--failed] [--code-change <sha>] # gh issues, GITHUB_TOKEN
 #
 # Everything a release contains is derived from one public image digest: the
 # version is its tag, the revision is its label, and stage 1, install.sh, the
@@ -19,6 +21,14 @@
 # channel never goes back to a lower version, and a version tag that now names
 # another digest is refused. A manifest older than seven days is re-signed with
 # the same fields (manifests live 30 days).
+#
+# The operator's SSH-signed vX.Y.Z tag is the only approval. A new version is
+# signed only with its proof (docs/strategy/auto-channel-signing-plan.md): the
+# public package's `proof-<version>` artifact holds the signed tag object, the
+# statement {version, revision, image digest} and the Sigstore bundle of
+# release.yml's run on that tag. `plan` verifies it and `sign` verifies it
+# again. A release without a valid proof is refused (refusals.tsv, then an
+# issue by `alert`); a refusal never blocks the re-sign of what is published.
 set -euo pipefail
 
 IMAGE="${TEND_INSTALL_IMAGE:-ghcr.io/tend-stack/tend-host}"
@@ -28,6 +38,19 @@ BASE_URL="${TEND_INSTALL_URL:-https://get.tend.host}"
 RELEASE_SPKI="MCowBQYDK2VwAyEA6mqh9euEIZV1KSTZzWBJ8xaluXkPBt5GGg+CuNLbuBM="
 # A dry run signs with a throwaway key and says so; it never publishes.
 SIGNING_SPKI="${TEND_INSTALL_DRY_RUN_SPKI:-$RELEASE_SPKI}"
+# Keys an already published manifest or install.sh may be signed with: the
+# release key, and in a dry run also the throwaway one.
+ACCEPT_SPKIS=("$SIGNING_SPKI")
+[[ $SIGNING_SPKI == "$RELEASE_SPKI" ]] || ACCEPT_SPKIS+=("$RELEASE_SPKI")
+# What a release must be proven by (plan, "Data shapes").
+TAG_SIGNER_PRINCIPAL="tend-release-tag"
+TAG_SIGNER_FPR="SHA256:N4c7qT2SWLc3+pgt+E6VLh3n2oFSJKcOwiXepOAIyfk"
+BUILDER_REPO="wilkinsantana/tend.host"
+BUILDER_WORKFLOW=".github/workflows/release.yml"
+OIDC_ISSUER="https://token.actions.githubusercontent.com"
+PROOF_TYPE="application/vnd.tend.release-proof.v1"
+PROOF_FILES=(tag.txt statement.json statement.sigstore.json)
+PROOF_MAX=65536
 LIFETIME=$((30 * 24 * 3600))
 RESIGN_AFTER=$((7 * 24 * 3600))
 PLATFORMS=(linux/amd64 linux/arm64)
@@ -42,6 +65,19 @@ RE_DIGEST='^sha256:[0-9a-f]{64}$'
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=verify-manifest.sh
 . "$here/verify-manifest.sh"
+
+# Production always uses the pinned signers file and the cosign on PATH. Only a
+# dry run (a throwaway signing key) may swap them, so a test can prove the
+# verification logic without Sigstore or the operator's key.
+TAG_SIGNERS="$here/../release-tag-signers"
+TAG_SIGNERS_PINNED=1
+COSIGN=cosign
+SOURCE_IMAGE="ghcr.io/wilkinsantana/tend-host"
+if [[ -n ${TEND_INSTALL_DRY_RUN_SPKI:-} && $SIGNING_SPKI != "$RELEASE_SPKI" ]]; then
+  SOURCE_IMAGE="${TEND_INSTALL_SOURCE_IMAGE:-$SOURCE_IMAGE}"
+  if [[ -n ${TEND_INSTALL_DRY_RUN_TAG_SIGNERS:-} ]]; then TAG_SIGNERS="$TEND_INSTALL_DRY_RUN_TAG_SIGNERS" TAG_SIGNERS_PINNED=0; fi
+  COSIGN="${TEND_INSTALL_COSIGN:-cosign}"
+fi
 
 die() { echo "tend-install: $*" >&2; exit 1; }
 say() { echo "$*" >&2; }
@@ -177,15 +213,166 @@ current_fields() {
   [[ -n $at ]] || die "$m has no published_at."
   local p
   for p in "${PLATFORMS[@]}"; do
-    tend_verify_manifest "$m" "$m.sig" "$2" "$p" "$at" "$SIGNING_SPKI" ||
+    tend_verify_manifest "$m" "$m.sig" "$2" "$p" "$at" "${ACCEPT_SPKIS[@]}" ||
       die "the published $2.json does not verify with the signing key; fix it by hand before signing again."
   done
   C_VERSION="$TEND_M_VERSION" C_DIGEST="$TEND_M_IMAGE_DIGEST" C_REVISION="$TEND_M_REVISION"
   C_PUBLISHED="$TEND_M_PUBLISHED_AT" C_SHA="$TEND_M_INSTALLER_SHA256" C_MIN="$TEND_M_MIN_UPGRADE_FROM"
 }
 
+# ---- the proof of a release (plan, invariant 1) ----
+# These helpers `die` on the first failed check. cmd_plan runs them in a
+# subshell so a refusal cannot stop the run; cmd_sign runs them bare.
+
+# load_tag_signers: the pinned file holds one line naming the principal and
+# one ed25519 key whose fingerprint is TAG_SIGNER_FPR.
+load_tag_signers() {
+  local lines=() line key fpr
+  [[ -f $TAG_SIGNERS && ! -L $TAG_SIGNERS ]] || die "the pinned release-tag-signers file is missing."
+  mapfile -t lines < "$TAG_SIGNERS"
+  [[ ${#lines[@]} -eq 1 ]] || die "release-tag-signers must hold exactly one line."
+  line="${lines[0]}"
+  [[ $line =~ ^${TAG_SIGNER_PRINCIPAL}\ namespaces=\"git\"\ (ssh-ed25519\ [A-Za-z0-9+/]+=*)$ ]] ||
+    die "release-tag-signers is not one '$TAG_SIGNER_PRINCIPAL namespaces=\"git\" ssh-ed25519 <key>' line."
+  ((TAG_SIGNERS_PINNED)) || return 0
+  key="$(mktemp)"
+  printf '%s\n' "${BASH_REMATCH[1]}" > "$key"
+  fpr="$(ssh-keygen -lf "$key" 2> /dev/null | cut -d' ' -f2)" || fpr=""
+  rm -f "$key"
+  [[ $fpr == "$TAG_SIGNER_FPR" ]] || die "release-tag-signers does not hold the pinned key $TAG_SIGNER_FPR."
+}
+
+# verify_tag_object <file> <version> <revision>: <file> is `git cat-file tag v<version>`
+# and was signed by the pinned operator key (ssh-keygen -Y verify -n git), and its
+# headers say `object <revision>`, `type commit`, `tag v<version>`, `tagger …`.
+verify_tag_object() {
+  local file="$1" v="$2" r="$3" work n head=()
+  [[ $v =~ $RE_VERSION && $r =~ $RE_HEX40 ]] || die "bad version or revision for the tag check."
+  [[ -f $file && ! -L $file ]] || die "the proof has no tag.txt."
+  load_tag_signers
+  n="$(grep -cxF -- '-----BEGIN SSH SIGNATURE-----' "$file" || true)"
+  [[ $n == 1 ]] || die "tag.txt must hold exactly one SSH signature."
+  [[ "$(tail -n 1 "$file")" == "-----END SSH SIGNATURE-----" ]] || die "tag.txt has text after the SSH signature."
+  mapfile -t head < <(head -n 4 "$file")
+  [[ ${#head[@]} -eq 4 && ${head[0]} == "object $r" && ${head[1]} == "type commit" && ${head[2]} == "tag v$v" && ${head[3]} == "tagger "* ]] ||
+    die "the signed tag does not say 'tag v$v' on commit $r."
+  work="$(mktemp -d)"
+  awk -v p="$work/payload" -v s="$work/sig" '
+    $0 == "-----BEGIN SSH SIGNATURE-----" { in_sig = 1 }
+    { if (in_sig) print > s; else print > p }' "$file"
+  if ! ssh-keygen -Y verify -f "$TAG_SIGNERS" -I "$TAG_SIGNER_PRINCIPAL" -n git -s "$work/sig" < "$work/payload" > /dev/null 2>&1; then
+    rm -rf "$work"
+    die "the tag v$v is not signed by the pinned release-tag key."
+  fi
+  rm -rf "$work"
+}
+
+# proof_manifest_ok <manifest.json> <version>: the artifact type, exactly three layers.
+proof_manifest_ok() {
+  jq -e --arg t "$PROOF_TYPE" '.artifactType == $t and (.layers | type == "array") and (.layers | length) == 3' "$1" > /dev/null 2>&1 ||
+    die "proof-$2 is not a $PROOF_TYPE artifact with three layers."
+}
+
+# proof_layer <manifest.json> <version> <title>: sets P_SIZE and P_DIGEST of the one layer with that
+# title, within the size cap.
+proof_layer() {
+  local row
+  row="$(jq -r --arg t "$3" '[.layers[] | select((.annotations // {})["org.opencontainers.image.title"] == $t)] |
+    if length == 1 then "\(.[0].size) \(.[0].digest)" else "bad" end' "$1" 2> /dev/null)" || row="bad"
+  [[ $row != bad ]] || die "proof-$2 does not carry exactly one $3."
+  P_SIZE="${row%% *}" P_DIGEST="${row#* }"
+  [[ $P_SIZE =~ ^[0-9]+$ && $P_SIZE -le $PROOF_MAX && $P_DIGEST =~ $RE_DIGEST ]] || die "proof-$2: $3 has a bad size or digest."
+}
+
+# fetch_proof <version> <dir>: the OCI artifact proof-<version> of the public
+# package into <dir>: artifactType, exactly three titled layers, size cap, blob digests.
+fetch_proof() {
+  local v="$1" dir="$2" work title
+  work="$(mktemp -d)"
+  reg_get "manifests/proof-$v" "$work/manifest.json" "application/vnd.oci.image.manifest.v1+json" ||
+    { rm -rf "$work"; die "$IMAGE has no proof-$v artifact; nothing proves release $v."; }
+  proof_manifest_ok "$work/manifest.json" "$v"
+  mkdir -p "$dir"
+  for title in "${PROOF_FILES[@]}"; do
+    proof_layer "$work/manifest.json" "$v" "$title"
+    reg_get "blobs/$P_DIGEST" "$dir/$title" || die "cannot read $title of proof-$v."
+    [[ "$(stat -c %s "$dir/$title")" == "$P_SIZE" && "sha256:$(sha256_of "$dir/$title")" == "$P_DIGEST" ]] ||
+      die "the registry returned another $title for proof-$v."
+  done
+  rm -rf "$work"
+}
+
+# verify_proof <dir> <version> <revision> <index digest>: invariant 1 (a) and (b).
+verify_proof() {
+  local dir="$1" v="$2" r="$3" d="$4" f want err
+  [[ $v =~ $RE_VERSION && $r =~ $RE_HEX40 && $d =~ $RE_DIGEST ]] || die "bad version, revision or digest for the proof check."
+  for f in "${PROOF_FILES[@]}"; do
+    [[ -f $dir/$f && ! -L $dir/$f ]] || die "the proof has no $f."
+  done
+  verify_tag_object "$dir/tag.txt" "$v" "$r"
+  want="$(mktemp)"
+  printf '{"schema":1,"version":"%s","revision":"%s","image_digest":"%s"}\n' "$v" "$r" "$d" > "$want"
+  cmp -s "$want" "$dir/statement.json" || { rm -f "$want"; die "statement.json does not say version $v, revision $r and digest $d."; }
+  rm -f "$want"
+  command -v "$COSIGN" > /dev/null 2>&1 || die "cosign is not installed."
+  err="$(mktemp)"
+  if ! "$COSIGN" verify-blob "$dir/statement.json" --bundle "$dir/statement.sigstore.json" \
+    --certificate-identity "https://github.com/$BUILDER_REPO/$BUILDER_WORKFLOW@refs/tags/v$v" \
+    --certificate-oidc-issuer "$OIDC_ISSUER" \
+    --certificate-github-workflow-repository "$BUILDER_REPO" \
+    --certificate-github-workflow-ref "refs/tags/v$v" \
+    --certificate-github-workflow-sha "$r" \
+    --certificate-github-workflow-trigger push > /dev/null 2> "$err"; then
+    tail -n 3 "$err" >&2
+    rm -f "$err"
+    die "the Sigstore proof does not show $BUILDER_REPO's release workflow building $v from $r."
+  fi
+  rm -f "$err"
+}
+
+# refuse <phase> <channel|-> <version> <reason>: a line for `alert` in $REFUSALS (phase plan or copy); nothing else changes.
+refuse() {
+  local reason
+  reason="$(printf '%s' "$4" | tr -d '\t\r\n' | cut -c1-200)"
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$reason" >> "$REFUSALS"
+  say "$1 $2 $3: REFUSED: $reason"
+}
+
+# try_release <channel> <version> <out>: the whole release path (inspect, fetch the
+# proof, verify it) in a subshell. TRY_OK=1 and <out>/<channel>/candidate.env on
+# success; TRY_OK=0 and a refusal otherwise. Called as a plain statement: bash
+# ignores `set -e` in anything run from an `if` or `||` condition, subshells included.
+try_release() {
+  local ch="$1" cand="$2" out="$3" errf rc reason min
+  errf="$(mktemp)"
+  set +e
+  (
+    set -e
+    inspect_release "$cand" "$out/$ch"
+    min="$(tr -d '[:space:]' < "$out/$ch/min-upgrade-from")"
+    [[ $min =~ $RE_VERSION ]] || die "min-upgrade-from of $cand is not a version."
+    ! version_lt "$cand" "$min" || die "min-upgrade-from $min of $cand is above the release itself."
+    fetch_proof "$cand" "$out/$ch/proof"
+    verify_proof "$out/$ch/proof" "$cand" "$R_REVISION" "$R_DIGEST"
+    printf 'digest=%s\nrevision=%s\nmin=%s\n' "$R_DIGEST" "$R_REVISION" "$min" > "$out/$ch/candidate.env"
+  ) > "$errf" 2>&1
+  rc=$?
+  set -e
+  cat "$errf" >&2
+  if ((rc == 0)); then
+    TRY_OK=1
+    say "$ch: proof verified"
+  else
+    TRY_OK=0
+    reason="$(grep -v '^[[:space:]]*$' "$errf" | tail -n 1 | sed 's/^tend-install: //')"
+    refuse plan "$ch" "$cand" "${reason:-the release check failed (exit $rc)}"
+    rm -rf "${out:?}/$ch"
+  fi
+  rm -f "$errf"
+}
+
 cmd_plan() {
-  local site="" out="" now force=0 tags ch cand any=0
+  local site="" out="" now force=0 tags ch cand any=0 refused=0 listed=1 released
   now="$(date +%s)"
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -196,26 +383,38 @@ cmd_plan() {
   done
   [[ -n $site && -n $out ]] || die "plan needs --site and --out."
   rm -rf "$out" && mkdir -p "$out"
+  REFUSALS="$out/refusals.tsv"
+  : > "$REFUSALS"
   tags="$(mktemp)"
-  reg_get "tags/list?n=10000" "$tags" || die "cannot list the tags of $IMAGE."
+  # A tag list that cannot be read refuses the new releases; published channels still re-sign.
+  if ! reg_get "tags/list?n=10000" "$tags"; then listed=0 && echo '{}' > "$tags"; fi
   {
     echo "now=$now"
     for ch in "${CHANNELS[@]}"; do
       cand="$(jq -r '.tags[]?' "$tags" | highest "$ch")"
+      ((listed)) || refuse plan "$ch" unknown "cannot list the tags of $IMAGE."
       current_fields "$site" "$ch"
+      released=0
       if [[ -n $cand ]] && { [[ -z $C_VERSION ]] || version_lt "$C_VERSION" "$cand"; }; then
-        inspect_release "$cand" "$out/$ch"
-        local min
-        min="$(tr -d '[:space:]' < "$out/$ch/min-upgrade-from")"
-        echo "${ch}_action=release"
-        echo "${ch}_version=$cand" "${ch}_digest=$R_DIGEST" "${ch}_revision=$R_REVISION" "${ch}_min=$min"
-        say "$ch: release $cand ($R_DIGEST, revision $R_REVISION)${C_VERSION:+, replacing $C_VERSION}"
-        any=1
-      elif [[ -n $C_VERSION ]]; then
-        if [[ -n $cand && $cand == "$C_VERSION" ]]; then
-          inspect_digest_only "$cand"
-          [[ $R_DIGEST == "$C_DIGEST" ]] || die "$IMAGE:$cand now names $R_DIGEST, but $ch.json pins $C_DIGEST; a version tag must never move."
+        try_release "$ch" "$cand" "$out"
+        if ((TRY_OK)); then
+          echo "${ch}_action=release"
+          echo "${ch}_version=$cand" "${ch}_digest=$(candidate_get "$out/$ch" digest)" "${ch}_revision=$(candidate_get "$out/$ch" revision)" "${ch}_min=$(candidate_get "$out/$ch" min)"
+          say "$ch: release $cand ($(candidate_get "$out/$ch" digest), revision $(candidate_get "$out/$ch" revision))${C_VERSION:+, replacing $C_VERSION}"
+          released=1 any=1
         fi
+      elif [[ -n $cand && $cand == "$C_VERSION" ]]; then
+        # The published version's tag must still name the pinned digest; if not (or if it
+        # cannot be read) alert, and keep re-signing the pinned digest: installs pull by digest.
+        if ! inspect_digest_only "$cand"; then
+          refuse plan "$ch" "$cand" "cannot read $IMAGE:$cand; $ch.json keeps pinning $C_DIGEST."
+        elif [[ $R_DIGEST != "$C_DIGEST" ]]; then
+          refuse plan "$ch" "$cand" "a version tag must never move: $IMAGE:$cand now names ${R_DIGEST:0:19}, but $ch.json pins ${C_DIGEST:0:19}."
+        fi
+      fi
+      if ((released)); then
+        continue
+      elif [[ -n $C_VERSION ]]; then
         if ((force || now - C_PUBLISHED >= RESIGN_AFTER)); then
           mkdir -p "$out/$ch"
           cp "$site/v1/install-panel-$C_VERSION.sh" "$out/$ch/install-panel.sh" ||
@@ -234,15 +433,21 @@ cmd_plan() {
         say "$ch: nothing published and no release tag"
       fi
     done
+    [[ -s $REFUSALS ]] && refused=1
+    echo "refused=$refused"
     echo "sign=$any"
   } > "$out/plan.env"
   rm -f "$tags"
 }
 
+# candidate_get <channel dir> <key>: one value of candidate.env, never evaluated.
+candidate_get() { sed -n "s/^$2=//p" "$1/candidate.env" | tail -n 1; }
+
+# inspect_digest_only <version>: sets R_DIGEST; returns 1 when the tag cannot be read.
 inspect_digest_only() {
   local f
   f="$(mktemp)"
-  reg_get "manifests/$1" "$f" "$ACCEPT_INDEX" || die "cannot read $IMAGE:$1."
+  if ! reg_get "manifests/$1" "$f" "$ACCEPT_INDEX"; then rm -f "$f"; return 1; fi
   R_DIGEST="sha256:$(sha256_of "$f")"
   rm -f "$f"
 }
@@ -266,8 +471,24 @@ sign_file() {
   rm -f "$msg"
 }
 
+# script_signature_ok <site> <scratch dir>: site/install.sh.sig is a valid signature (by the
+# release key; in a dry run also the throwaway one) over "$SCRIPT_DOMAIN\n" + install.sh.
+script_signature_ok() {
+  local site="$1" tmp="$2" spki
+  [[ -f $site/install.sh && -f $site/install.sh.sig ]] || return 1
+  { printf '%s\n' "$SCRIPT_DOMAIN"; cat "$site/install.sh"; } > "$tmp/script.msg"
+  base64 -d "$site/install.sh.sig" > "$tmp/script.sig" 2> /dev/null || return 1
+  for spki in "${ACCEPT_SPKIS[@]}"; do
+    printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "$spki" > "$tmp/script.pub"
+    if openssl pkeyutl -verify -pubin -inkey "$tmp/script.pub" -rawin -in "$tmp/script.msg" -sigfile "$tmp/script.sig" > /dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 cmd_sign() {
-  local site="" plan="" now key spki keyid ch action version digest revision min sha url published expires
+  local site="" plan="" now key spki keyid ch action version digest revision min sha url published expires replaced=0
   now="$(date +%s)"
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -299,6 +520,15 @@ cmd_sign() {
     [[ -f $plan/$ch/install-panel.sh ]] || die "$ch: the plan has no stage 1."
     sha="$(sha256_of "$plan/$ch/install-panel.sh")"
     [[ $sha =~ $RE_HEX64 ]] || die "$ch: cannot hash stage 1."
+    # The plan is only a claim: judge it again against the published manifest and the proof.
+    current_fields "$site" "$ch"
+    if [[ $action == release ]]; then
+      [[ -z $C_VERSION ]] || version_lt "$C_VERSION" "$version" || die "$ch: $version is not above the published $C_VERSION."
+      verify_proof "$plan/$ch/proof" "$version" "$revision" "$digest"
+    else
+      [[ -n $C_VERSION && $version == "$C_VERSION" && $digest == "$C_DIGEST" && $revision == "$C_REVISION" && $min == "$C_MIN" && $sha == "$C_SHA" ]] ||
+        die "$ch: the re-sign plan differs from the published $ch.json; only its own fields may be signed again."
+    fi
     url="$BASE_URL/v1/install-panel-$version.sh"
     cp "$plan/$ch/install-panel.sh" "$site/v1/install-panel-$version.sh"
     write_manifest "$site/v1/$ch.json.new" "$ch" "$expires" "$IMAGE" "$digest" "$sha" "$url" "$keyid" "$min" "$published" "$revision" "$version"
@@ -313,14 +543,21 @@ cmd_sign() {
       grep -qF "\"$RELEASE_SPKI\"" "$plan/$ch/install.sh" || die "$ch: the image's install.sh does not pin the release key."
       cp "$plan/$ch/install.sh" "$site/install.sh"
       cp "$plan/$ch/tend-panel-release-1.pub.pem" "$site/tend-panel-release-1.pub.pem"
+      replaced=1
     fi
     say "$ch: signed $version ($action), expires $(date -u -d "@$expires" +%Y-%m-%dT%H:%MZ)"
   done
   [[ -f $site/install.sh ]] || die "no install.sh to publish yet."
   [[ "$(openssl pkey -pubin -in "$site/tend-panel-release-1.pub.pem" -outform DER | base64 -w0)" == "$RELEASE_SPKI" ]] ||
     die "tend-panel-release-1.pub.pem is not the release key."
-  printf '%s  install.sh\n' "$(sha256_of "$site/install.sh")" > "$site/install.sh.sha256"
-  sign_file "$key" "$SCRIPT_DOMAIN" "$site/install.sh" "$site/install.sh.sig"
+  if ((replaced)); then
+    # Bytes extracted from a proven image in this run.
+    printf '%s  install.sh\n' "$(sha256_of "$site/install.sh")" > "$site/install.sh.sha256"
+    sign_file "$key" "$SCRIPT_DOMAIN" "$site/install.sh" "$site/install.sh.sig"
+  else
+    # A re-sign never signs install.sh: the signature already there must verify, and stays.
+    script_signature_ok "$site" "$KEYDIR" || die "site/install.sh does not verify with install.sh.sig; fix it by hand."
+  fi
   rm -f "$key"
   # Only the stage 1 files a channel names stay on the site; releases keep the rest.
   local keep f
@@ -345,6 +582,10 @@ cmd_publish() {
   done
   [[ $SIGNING_SPKI == "$RELEASE_SPKI" ]] || die "a dry run never publishes."
   git add -A -- "$site"
+  # The workflow bot writes site/ and nothing else (the release key lives on this branch).
+  local outside
+  outside="$(git diff --cached --name-only --no-renames | awk -v p="${site%/}/" 'index($0, p) != 1')"
+  [[ -z $outside ]] || die "refusing to commit paths outside $site/: $(head -n 3 <<< "$outside" | tr '\n' ' ')"
   if git diff --cached --quiet; then say "nothing changed on the site."; else
     git -c user.name="tend-install" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
       commit -q -m "release: $(tr '\n' ' ' < "$plan/plan.env" | sed 's/now=[0-9]* //')"
@@ -377,9 +618,194 @@ cmd_publish() {
   done < <(gh release view channels --json assets --jq '.assets[].name')
 }
 
-case "${1:-}" in
-  plan) shift; cmd_plan "$@" ;;
-  sign) shift; cmd_sign "$@" ;;
-  publish) shift; cmd_publish "$@" ;;
-  *) die "usage: tend-install.sh plan|sign|publish ..." ;;
-esac
+# ---- copy: the private package to the public one, only what has a proof ----
+# Runs in the `copy` job with tend-install's own GITHUB_TOKEN (packages: write) and
+# never sees the release key. Registry credentials come as docker config files
+# (TEND_COPY_FROM_CONFIG for the private package, TEND_COPY_TO_CONFIG for the
+# public one); no token is ever an argument.
+
+# public_digest <tag>: the digest of the public package's manifest for <tag>, or nothing.
+public_digest() {
+  local f
+  f="$(mktemp)"
+  if reg_get "manifests/$1" "$f" "$ACCEPT_INDEX, $ACCEPT_IMAGE"; then printf 'sha256:%s' "$(sha256_of "$f")"; fi
+  rm -f "$f"
+}
+
+# oras_resolve <reference>: the digest <reference> names in the private package.
+oras_resolve() {
+  local d
+  d="$(oras resolve "${ORAS_PLAIN[@]}" --registry-config "$TEND_COPY_FROM_CONFIG" "$1")" || die "cannot read $1."
+  [[ $d =~ $RE_DIGEST ]] || die "$1 resolved to something that is not a digest."
+  printf '%s' "$d"
+}
+
+# copy_one <version>: verify the private proof, then copy proof-<version> and <version>
+# (proof first, so plan never sees the image without its proof). Dies on any failure.
+copy_one() {
+  local v="$1" work title p_digest d_digest r pub_p pub_v
+  work="$(mktemp -d)"
+  p_digest="$(oras_resolve "$SOURCE_IMAGE:proof-$v")"
+  d_digest="$(oras_resolve "$SOURCE_IMAGE:$v")"
+  oras manifest fetch "${ORAS_PLAIN[@]}" --registry-config "$TEND_COPY_FROM_CONFIG" "$SOURCE_IMAGE@$p_digest" > "$work/manifest.json" ||
+    die "cannot read proof-$v."
+  [[ "sha256:$(sha256_of "$work/manifest.json")" == "$p_digest" ]] || die "the registry returned another manifest for proof-$v."
+  proof_manifest_ok "$work/manifest.json" "$v"
+  oras pull "${ORAS_PLAIN[@]}" --registry-config "$TEND_COPY_FROM_CONFIG" -o "$work/proof" "$SOURCE_IMAGE@$p_digest" > /dev/null ||
+    die "cannot pull proof-$v."
+  [[ "$(find "$work/proof" -mindepth 1 | wc -l)" -eq 3 ]] || die "proof-$v pulled more or fewer than three files."
+  for title in "${PROOF_FILES[@]}"; do
+    proof_layer "$work/manifest.json" "$v" "$title"
+    [[ -f $work/proof/$title && ! -L $work/proof/$title && "sha256:$(sha256_of "$work/proof/$title")" == "$P_DIGEST" ]] ||
+      die "proof-$v: $title does not match its layer."
+  done
+  r="$(sed -n 's/^object //p' "$work/proof/tag.txt" | head -n 1)"
+  [[ $r =~ $RE_HEX40 ]] || die "proof-$v: tag.txt names no commit."
+  verify_proof "$work/proof" "$v" "$r" "$d_digest"
+  pub_v="$(public_digest "$v")"
+  [[ -z $pub_v || $pub_v == "$d_digest" ]] || die "the public $v already names ${pub_v:0:19}, not the private ${d_digest:0:19}; a version tag must never move."
+  pub_p="$(public_digest "proof-$v")"
+  [[ -z $pub_p || $pub_p == "$p_digest" ]] || die "the public proof-$v already names another artifact."
+  if [[ -z $pub_p ]]; then
+    oras cp "${ORAS_FROM_PLAIN[@]}" "${ORAS_TO_PLAIN[@]}" --from-registry-config "$TEND_COPY_FROM_CONFIG" --to-registry-config "$TEND_COPY_TO_CONFIG" \
+      "$SOURCE_IMAGE@$p_digest" "$IMAGE:proof-$v" > /dev/null || die "cannot copy proof-$v."
+    say "copied proof-$v"
+  fi
+  if [[ -z $pub_v ]]; then
+    oras cp "${ORAS_FROM_PLAIN[@]}" "${ORAS_TO_PLAIN[@]}" --from-registry-config "$TEND_COPY_FROM_CONFIG" --to-registry-config "$TEND_COPY_TO_CONFIG" \
+      "$SOURCE_IMAGE@$d_digest" "$IMAGE:$v" > /dev/null || die "cannot copy $v."
+    say "copied $v"
+  fi
+  [[ "$(public_digest "$v")" == "$d_digest" && "$(public_digest "proof-$v")" == "$p_digest" ]] ||
+    die "after the copy the public $v or proof-$v does not match the private digest."
+  rm -rf "$work"
+}
+
+# try_copy <version>: copy_one in a subshell with `set -e` honoured (see try_release);
+# a failure is a copy-phase refusal and the next candidate goes on.
+try_copy() {
+  local v="$1" errf rc reason
+  errf="$(mktemp)"
+  set +e
+  (
+    set -e
+    copy_one "$v"
+  ) > "$errf" 2>&1
+  rc=$?
+  set -e
+  cat "$errf" >&2
+  if ((rc != 0)); then
+    reason="$(grep -v '^[[:space:]]*$' "$errf" | tail -n 1 | sed 's/^tend-install: //')"
+    refuse copy - "$v" "${reason:-the copy failed (exit $rc)}"
+  fi
+  rm -f "$errf"
+}
+
+# copy --out <dir>: <dir>/copy-refusals.tsv lists what was refused.
+cmd_copy() {
+  local out="" priv pub t cands=() stable any n=0 v
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --out) out="$2"; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  [[ -n $out ]] || die "copy needs --out."
+  [[ -n ${TEND_COPY_FROM_CONFIG:-} && -n ${TEND_COPY_TO_CONFIG:-} ]] || die "copy needs TEND_COPY_FROM_CONFIG and TEND_COPY_TO_CONFIG (docker config files)."
+  command -v oras > /dev/null 2>&1 || die "oras is not installed."
+  ORAS_PLAIN=() ORAS_FROM_PLAIN=() ORAS_TO_PLAIN=()
+  if [[ $SCHEME == http ]]; then ORAS_PLAIN=(--plain-http) ORAS_FROM_PLAIN=(--from-plain-http) ORAS_TO_PLAIN=(--to-plain-http); fi
+  mkdir -p "$out"
+  REFUSALS="$out/copy-refusals.tsv"
+  : > "$REFUSALS"
+  priv="$(mktemp)" pub="$(mktemp)"
+  oras repo tags "${ORAS_PLAIN[@]}" --registry-config "$TEND_COPY_FROM_CONFIG" "$SOURCE_IMAGE" > "$priv" || die "cannot list the tags of $SOURCE_IMAGE."
+  reg_get "tags/list?n=10000" "$pub" || die "cannot list the tags of $IMAGE."
+  stable="$(jq -r '.tags[]?' "$pub" | highest stable)"
+  any="$(jq -r '.tags[]?' "$pub" | highest beta)"
+  # A candidate has a proof in the private package, is not yet public with its proof, and is not below
+  # what is public (stable-class: the highest public stable or above; a prerelease: the highest public
+  # version or above). "Or equal" lets a version that is public without a proof be refused loudly if its
+  # digest differs, instead of being skipped silently.
+  while IFS= read -r t; do
+    version_key "$t" > /dev/null 2>&1 || continue
+    grep -qxF -- "proof-$t" "$priv" || continue
+    if jq -e --arg t "$t" '.tags | index($t) != null and index("proof-" + $t) != null' "$pub" > /dev/null; then continue; fi
+    if [[ $t == *-* ]]; then
+      [[ -z $any ]] || ! version_lt "$t" "$any" || continue
+    else
+      [[ -z $stable ]] || ! version_lt "$t" "$stable" || continue
+    fi
+    cands+=("$t")
+  done < <(sort -u "$priv" | while IFS= read -r t; do k="$(version_key "$t" 2> /dev/null)" && printf '%s %s\n' "$k" "$t"; done | LC_ALL=C sort -r | cut -d' ' -f2)
+  for v in "${cands[@]}"; do
+    ((n < 3)) || break
+    n=$((n + 1))
+    try_copy "$v"
+  done
+  say "copy: ${#cands[@]} candidate(s), $(wc -l < "$REFUSALS") refused."
+  rm -f "$priv" "$pub"
+}
+
+# raise_issue <title> <body>: one open issue per title; never a comment on a repeat.
+raise_issue() {
+  local open
+  open="$(gh issue list --state open --search "in:title $1" --limit 100 --json title --jq '.[].title')" ||
+    die "cannot list the open issues."
+  if grep -qxF -- "$1" <<< "$open"; then say "an issue titled '$1' is already open."; return 0; fi
+  gh issue create --title "$1" --body "$2" > /dev/null || die "cannot create the issue '$1'."
+  say "opened an issue: $1"
+}
+
+# alert --plan <dir> [--failed] [--code-change <sha>]: one issue per line of <dir>/refusals.tsv
+# and <dir>/copy-refusals.tsv (`<phase>\t<channel|->\t<version>\t<reason>`), one for a failed run,
+# one for a code change on main. Works without a plan directory.
+cmd_alert() {
+  local plan="" failed=0 code="" phase ch version reason run="" file title body
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --plan) plan="$2"; shift 2 ;; --failed) failed=1; shift ;;
+      --code-change) code="$2"; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  if [[ -n ${GITHUB_RUN_ID:-} ]]; then run="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/$GITHUB_RUN_ID"; fi
+  if [[ -n $plan ]]; then
+    for file in "$plan/refusals.tsv" "$plan/copy-refusals.tsv"; do
+      [[ -s $file ]] || continue
+      while IFS=$'\t' read -r phase ch version reason || [[ -n $phase ]]; do
+        if [[ $phase == plan && $ch =~ ^(stable|beta)$ && ($version =~ $RE_VERSION || $version == unknown) ]]; then
+          title="Install channel refused $ch $version"
+          body="The $ch channel did not take $version, so it was not signed; published channels keep being re-signed."
+        elif [[ $phase == copy && $ch == - && $version =~ $RE_VERSION ]]; then
+          title="Image copy refused $version"
+          body="$version was not copied from the private package to the public one, so nothing can sign it."
+        else
+          say "skipping a malformed refusal line."
+          continue
+        fi
+        raise_issue "$title" "$body"$'\n\n'"Reason: $reason"$'\n\n'"Run: ${run:-unknown}"
+      done < "$file"
+    done
+  fi
+  if ((failed)); then
+    raise_issue "Install channel workflow failed" "The install channel workflow failed, so nothing new was signed. Published manifests expire 30 days after they were signed: fix this before then."$'\n\n'"Run: ${run:-unknown}"
+  fi
+  if [[ -n $code ]]; then
+    [[ $code =~ $RE_HEX40 ]] || die "--code-change needs a commit sha."
+    raise_issue "tend-install code changed ${code:0:7}" "Commit $code changed files outside site/ on main. Code here is replaced only by the operator's sync from the panel repository; if you did not make this change, treat the release key as exposed (docs/agent/panel-release-keys.md)."$'\n\n'"Commit: ${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/commit/$code"
+  fi
+}
+
+
+# Sourcing the file (the tests do) defines the functions and runs nothing.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  case "${1:-}" in
+    plan) shift; cmd_plan "$@" ;;
+    sign) shift; cmd_sign "$@" ;;
+    publish) shift; cmd_publish "$@" ;;
+    alert) shift; cmd_alert "$@" ;;
+    copy) shift; cmd_copy "$@" ;;
+    *) die "usage: tend-install.sh copy|plan|sign|publish|alert ..." ;;
+  esac
+fi
