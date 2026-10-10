@@ -28,6 +28,8 @@
 #
 # Options: --public | --local, --local-name=<name>, --allow-downgrade,
 #          --use-existing-docker, --yes (no questions), --help,
+#          --ssh-keys-only (turn SSH password logins off, see below),
+#          --keep-ssh-passwords (never offer that),
 #          --take-over-ports (stop a web proxy that holds ports 80/443 without
 #          asking; it is stopped and kept from starting at boot, never removed)
 # Environment: TEND_LOCAL_MODE=1|0, TEND_LOCAL_NAME, TEND_PUBLIC_IP,
@@ -35,7 +37,12 @@
 #   start, TEND_SETUP_CODE (automated installs; never written to disk),
 #   INSTALL_DIR, TEND_HOST_DATA_DIR, SKIP_HARDENING=1, SKIP_SYSTEM_UPDATE=1.
 #
-# It never changes SSH configuration and never needs a password or token.
+# SSH: password logins are turned off only when you sign in with a key (proven
+# from authorized_keys and the sign-in log), you type yes (or pass
+# --ssh-keys-only), and sshd accepts the change; --yes alone never does it. The
+# setting goes in /etc/ssh/sshd_config.d/00-tend-keys-only.conf and is put back
+# if the check fails. Nothing else about SSH is touched, and the installer never
+# needs a password or token.
 
 set -euo pipefail
 
@@ -1014,6 +1021,174 @@ harden_vps() {
   record "Firewall: SSH ${ssh_port}, 80, 443 only (Tend's own port 8787 is not published at all)"
 }
 
+# ---- SSH: offer to turn password logins off ------------------------------------
+# Changed only after a key sign-in is proven, only when the person types yes (or
+# passes --ssh-keys-only), and put back unless `sshd -t` passes and `sshd -T`
+# confirms the result. The paths can be pointed elsewhere for the tests.
+
+SSHD_CONFIG="${SSHD_CONFIG:-/etc/ssh/sshd_config}"
+SSHD_DROPIN_DIR="${SSHD_DROPIN_DIR:-/etc/ssh/sshd_config.d}"
+SSHD_DROPIN_NAME="00-tend-keys-only.conf"
+SSHD_RUN_DIR="${SSHD_RUN_DIR:-/run/sshd}"
+PASSWD_FILE="${PASSWD_FILE:-/etc/passwd}"
+SHADOW_FILE="${SHADOW_FILE:-/etc/shadow}"
+SSH_MARK_BEGIN="# BEGIN tend keys-only (added by the Tend installer)"
+SSH_MARK_END="# END tend keys-only"
+SSH_KEY_TYPES='ssh-ed25519|ssh-rsa|ssh-dss|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com'
+
+sshd_bin() { command -v sshd 2> /dev/null || { [[ -x /usr/sbin/sshd ]] && echo /usr/sbin/sshd; } || true; }
+# sshd_value KEY: the effective setting from `sshd -T` (key in lower case), empty when unknown.
+sshd_value() { local b; b="$(sshd_bin)"; [[ -n $b ]] || return 0; "$b" -T 2> /dev/null | awk -v k="$1" '$1 == k {print $2; exit}' || true; }
+# ssh_kbd_key: the keyboard-interactive keyword this sshd knows (old ones only know the ChallengeResponse name).
+ssh_kbd_key() { if [[ -n "$(sshd_value kbdinteractiveauthentication)" || -z "$(sshd_value challengeresponseauthentication)" ]]; then echo kbdinteractiveauthentication; else echo challengeresponseauthentication; fi; }
+
+# valid_key_line LINE: an authorized_keys line that carries a public key (comments, blanks and junk do not).
+valid_key_line() {
+  local l="${1#"${1%%[![:space:]]*}"}" re="(^|[[:space:]])(${SSH_KEY_TYPES})[[:space:]]+[A-Za-z0-9+/]{16,}={0,3}([[:space:]]|\$)"
+  [[ $l != \#* ]] && [[ $l =~ $re ]]
+}
+# count_keys FILE: how many valid key lines the file holds (0 if it is missing or unreadable).
+count_keys() {
+  local n=0 l
+  [[ -r $1 ]] || { echo 0; return 0; }
+  while IFS= read -r l || [[ -n $l ]]; do if valid_key_line "$l"; then n=$((n + 1)); fi; done < "$1"
+  echo "$n"
+}
+# user_key_count USER: valid keys in that account's ~/.ssh/authorized_keys.
+user_key_count() { local h; h="$(getent passwd "$1" 2> /dev/null | cut -d: -f6)" || h=""; if [[ -n $h ]]; then count_keys "$h/.ssh/authorized_keys"; else echo 0; fi; }
+# password_account_count: login accounts that hold a usable password hash. Only the count is ever shown.
+password_account_count() {
+  [[ -r $SHADOW_FILE && -r $PASSWD_FILE ]] || { echo 0; return 0; }
+  awk -F: 'NR == FNR { if ($7 != "" && $7 !~ /(nologin|false)$/) ok[$1] = 1; next } ($1 in ok) && $2 ~ /^\$/ { n++ } END { print n + 0 }' "$PASSWD_FILE" "$SHADOW_FILE"
+}
+# session_client_ip: the address this SSH session came from ($SSH_CONNECTION; sudo drops it, so the
+# parent processes' environment is searched too). Empty when this is not an SSH session.
+session_client_ip() {
+  local c="${SSH_CONNECTION:-}" pid="$$" i f
+  if [[ -z $c ]]; then
+    for ((i = 0; i < 25; i++)); do
+      f="${PROC_ROOT:-/proc}/$pid/environ"
+      if [[ -r $f ]]; then c="$(tr '\0' '\n' < "$f" 2> /dev/null | sed -n 's/^SSH_CONNECTION=//p' | head -1)" || c=""; [[ -z $c ]] || break; fi
+      pid="$(awk '/^PPid:/ {print $2}' "${PROC_ROOT:-/proc}/$pid/status" 2> /dev/null)" || pid=""
+      if [[ ! $pid =~ ^[0-9]+$ ]] || ((pid <= 1)); then break; fi
+    done
+  fi
+  printf '%s' "${c%% *}"
+}
+# journal_has_publickey USER IP: sshd logged a key sign-in for USER from IP in the last hour.
+journal_has_publickey() {
+  local out
+  [[ -n $1 && -n $2 ]] || return 1
+  out="$(journalctl -u ssh -u sshd --since '1 hour ago' --no-pager -q -o cat 2> /dev/null)" || out=""
+  [[ $out == *"Accepted publickey for $1 from $2 port"* ]]
+}
+ssh_reload() { systemctl reload ssh 2> /dev/null || systemctl reload sshd 2> /dev/null; }
+# ssh_undo MODE FILE BACKUP: put the SSH configuration back as it was before ssh_apply_keys_only.
+ssh_undo() {
+  if [[ $1 == dropin ]]; then if [[ -n $3 ]]; then cat "$3" > "$2"; else rm -f "$2"; fi
+  elif [[ -f $SSHD_CONFIG.tend-bak ]]; then cat "$SSHD_CONFIG.tend-bak" > "$SSHD_CONFIG"; fi
+}
+
+# ssh_apply_keys_only: write the setting, check it, reload, verify. Returns 1 (everything put back)
+# when a check fails, and says why. The running session is never restarted, only reloaded.
+ssh_apply_keys_only() {
+  local conf="$SSHD_CONFIG" file="$SSHD_DROPIN_DIR/$SSHD_DROPIN_NAME" mode bak="" kbdkey kbdword block why="" tmp
+  kbdkey="$(ssh_kbd_key)"
+  if [[ $kbdkey == kbdinteractiveauthentication ]]; then kbdword=KbdInteractiveAuthentication; else kbdword=ChallengeResponseAuthentication; fi
+  block="PasswordAuthentication no"$'\n'"$kbdword no"
+  [[ -d $SSHD_RUN_DIR ]] || mkdir -p "$SSHD_RUN_DIR" 2> /dev/null || true
+  tmp="$(mktemp)"
+  if grep -Eiq '^[[:space:]]*Include[[:space:]]+(/etc/ssh/)?sshd_config\.d/\*\.conf' "$conf" 2> /dev/null; then
+    mode=dropin
+    if [[ -f $file ]]; then bak="$(mktemp)"; cp -p "$file" "$bak"; fi
+    mkdir -p "$SSHD_DROPIN_DIR"
+    printf '# Written by the Tend installer. Delete this file and reload ssh to allow SSH passwords again.\n%s\n' "$block" > "$file"
+    chmod 0644 "$file"
+  else
+    # No drop-in directory: the first value wins in sshd_config, so the block goes at the very top.
+    mode=main
+    if ! grep -qF "$SSH_MARK_BEGIN" "$conf" 2> /dev/null; then
+      cp -p "$conf" "$conf.tend-bak"
+      { printf '%s\n%s\n%s\n\n' "$SSH_MARK_BEGIN" "$block" "$SSH_MARK_END"; cat "$conf"; } > "$tmp"
+      cat "$tmp" > "$conf"
+    fi
+  fi
+  rm -f "$tmp"
+  if ! "$(sshd_bin)" -t 2> /dev/null; then why="the SSH configuration check (sshd -t) failed"
+  elif ! ssh_reload; then why="the SSH service would not reload"
+  elif [[ "$(sshd_value passwordauthentication)" != no || "$(sshd_value "$kbdkey")" == yes ]]; then why="SSH would still accept passwords because an earlier setting wins"
+  fi
+  if [[ -n $why ]]; then
+    ssh_undo "$mode" "$file" "$bak"; ssh_reload || true
+    [[ -z $bak ]] || rm -f "$bak"
+    c_warn "Password logins were left on: $why. Nothing was changed."
+    return 1
+  fi
+  [[ -z $bak ]] || rm -f "$bak"
+  if [[ $mode == dropin ]]; then SSH_FILE="$file"; else SSH_FILE="$conf"; fi
+  return 0
+}
+
+# ssh_keys_only_step: runs after hardening. Sets SSH_STATE for the final screen:
+#   off (keys only), offer (key login proven, password logins left on), nokey (key login not proven),
+#   kept (--keep-ssh-passwords). Never stops the install.
+ssh_keys_only_step() {
+  [[ ${SKIP_HARDENING:-0} != 1 ]] || return 0
+  [[ -n "$(sshd_bin)" ]] || return 0
+  local pw kbd user ip n_keys n_acc ans undo_text
+  SSH_STATE=""
+  c_step "Checking how people sign in over SSH"
+  pw="$(sshd_value passwordauthentication)"; kbd="$(sshd_value "$(ssh_kbd_key)")"
+  if [[ -z $pw ]]; then c_ok "Could not read the SSH settings, so they were left alone"; return 0; fi
+  if [[ $pw == no && $kbd != yes ]]; then SSH_STATE=off; c_ok "SSH already refuses passwords (keys only)"; return 0; fi
+  if [[ ${KEEP_SSH_PASSWORDS:-0} == 1 ]]; then SSH_STATE=kept; c_ok "SSH password logins left on (--keep-ssh-passwords)"; return 0; fi
+  user="${SUDO_USER:-root}"; ip="$(session_client_ip)"
+  n_keys="$(user_key_count "$user")"
+  if ((n_keys == 0)) || ! journal_has_publickey "$user" "$ip"; then
+    SSH_STATE=nokey
+    c_warn "SSH accepts passwords, and a key sign-in could not be confirmed, so nothing was changed."
+    return 0
+  fi
+  n_acc="$(password_account_count)"
+  if [[ ${SSH_KEYS_ONLY:-0} != 1 ]]; then
+    if [[ ${ASSUME_YES:-0} == 1 ]] || ! tty_ok; then
+      SSH_STATE=offer; c_warn "SSH password logins stay on. Run the installer again with --ssh-keys-only to turn them off."
+      return 0
+    fi
+    echo
+    echo "    Your server lets anyone try passwords over SSH."
+    echo "    You signed in with a key, so we can turn password"
+    echo "    logins off. Scanners then can't even try."
+    if ((n_acc > 0)); then
+      echo "    ($n_acc account(s) here have a password. It keeps working"
+      echo "    on the console; only SSH stops accepting it.)"
+    fi
+    printf '\n    Turn password logins off? Type yes to do it, or press Enter to skip: ' 2> /dev/null > /dev/tty || true
+    ans="$(tty_line)"
+    if [[ $ans != yes ]]; then SSH_STATE=offer; c_ok "Skipped. SSH password logins stay on."; return 0; fi
+  fi
+  if ssh_apply_keys_only; then
+    SSH_STATE=off
+    if [[ $SSH_FILE == "$SSHD_CONFIG" ]]; then undo_text="restore $SSHD_CONFIG.tend-bak, then: sudo systemctl reload ssh"
+    else undo_text="sudo rm $SSH_FILE && sudo systemctl reload ssh"; fi
+    c_ok "SSH password logins are off. Your key still works."
+    echo "        To undo: $undo_text"
+    record "SSH: keys only, password logins off (undo: $undo_text)"
+  else
+    SSH_STATE=offer
+  fi
+  return 0
+}
+# ssh_row_lines: the SSH line(s) for the boxed end screen (each at most 54 characters).
+ssh_row_lines() {
+  case "${SSH_STATE:-}" in
+    off) echo "SSH: keys only (password logins off)" ;;
+    offer) echo "SSH: password logins are on. To turn them off,"; echo "run the installer again with --ssh-keys-only." ;;
+    nokey) echo "SSH: password logins are on. Add an SSH key,"; echo "then run the installer with --ssh-keys-only." ;;
+    kept) echo "SSH: password logins left on, as you asked." ;;
+  esac
+}
+
 # harden_home: a home box often runs other services (a NAS), so ufw is turned
 # on only when nothing else listens. The web ports are limited in DOCKER-USER.
 harden_home() {
@@ -1262,11 +1437,13 @@ panel_url() {
 # steps, nothing that scrolls away.
 final_box() {
   local url="${1:-$(panel_url)}" words line n
-  local -a nwords
+  local -a nwords sshrows
   local -a rows=()
+  mapfile -t sshrows < <(ssh_row_lines)
   echo
   if [[ ${ADMIN_EXISTS:-0} == 1 ]]; then
     rows=("" "Open:  $url" "Sign in with your account." "Forgot the password?  sudo tend reset-admin")
+    if ((${#sshrows[@]} > 0)); then rows+=("" "${sshrows[@]}"); fi
     ui_box "Tend is ready." "${rows[@]}"
     return 0
   fi
@@ -1289,6 +1466,7 @@ final_box() {
     rows+=("2. Show the setup code:  sudo tend setup-code" "3. Make your account.")
   fi
   rows+=("" "Lost the code?  sudo tend setup-code" "Want your own address, like panel.example.com?" "Set it in Tend after you sign in.")
+  if ((${#sshrows[@]} > 0)); then rows+=("" "${sshrows[@]}"); fi
   ui_box "Tend is ready. Finish in 3 steps:" "${rows[@]}"
 }
 
@@ -1376,7 +1554,7 @@ summary() {
 usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }
 
 main() {
-  ASSUME_YES=0; ALLOW_DOWNGRADE=0; USE_EXISTING_DOCKER=0; CLOUD=0; TAKE_OVER_PORTS=0
+  ASSUME_YES=0; ALLOW_DOWNGRADE=0; USE_EXISTING_DOCKER=0; CLOUD=0; TAKE_OVER_PORTS=0; SSH_KEYS_ONLY=0; KEEP_SSH_PASSWORDS=0; SSH_STATE=""
   SKIP_HARDENING="${SKIP_HARDENING:-0}"; SKIP_SYSTEM_UPDATE="${SKIP_SYSTEM_UPDATE:-0}"
   LOCAL_MODE="${TEND_LOCAL_MODE:-}"; LOCAL_NAME="${TEND_LOCAL_NAME:-tend}"; LOCAL_NAME_GIVEN=0
   [[ -z ${TEND_LOCAL_NAME:-} ]] || LOCAL_NAME_GIVEN=1
@@ -1387,10 +1565,12 @@ main() {
     case "$arg" in
       --local) LOCAL_MODE=1 ;; --public) LOCAL_MODE=0 ;; --local-name=*) LOCAL_NAME="${arg#*=}"; LOCAL_NAME_GIVEN=1 ;;
       --allow-downgrade) ALLOW_DOWNGRADE=1 ;; --use-existing-docker) USE_EXISTING_DOCKER=1 ;; -y | --yes) ASSUME_YES=1 ;; --take-over-ports) TAKE_OVER_PORTS=1 ;;
+      --ssh-keys-only) SSH_KEYS_ONLY=1 ;; --keep-ssh-passwords) KEEP_SSH_PASSWORDS=1 ;;
       -h | --help) usage; exit 0 ;;
       *) echo "Unknown option: $arg (see --help)" >&2; exit 2 ;;
     esac
   done
+  [[ $SSH_KEYS_ONLY == 0 || $KEEP_SSH_PASSWORDS == 0 ]] || { echo "Choose one: --ssh-keys-only or --keep-ssh-passwords (see --help)" >&2; exit 2; }
   [[ -n ${TEND_M_IMAGE_DIGEST:-} && -n ${TEND_M_VERSION:-} && -n ${TEND_M_IMAGE:-} ]] ||
     die "Run this through install.sh, which verifies the signed release first: curl -fsSL https://get.tend.host/install.sh | sudo bash"
   trap cleanup_on_exit EXIT
@@ -1447,6 +1627,7 @@ main() {
   if [[ $PROFILE == vps ]]; then update_system; fi
   install_base_packages
   if [[ $PROFILE == vps ]]; then harden_vps; else harden_home; fi
+  ssh_keys_only_step
   install_docker
   if [[ $PROFILE == home ]]; then install_lan_firewall; else drop_home_leftovers; fi
   write_stack
