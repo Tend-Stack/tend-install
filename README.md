@@ -14,6 +14,11 @@ curl -fsSL https://get.tend.host/install.sh | sudo bash
     manifest, checks its Ed25519 signature against the key written inside it,
     downloads the full installer the manifest names, checks its SHA-256, and runs it.
   - `install.sh.sha256`, `install.sh.sig`: its checksum and its signature.
+  - `compose.yml`, `compose.yml.sig`: the Docker Compose install for people who
+    already run Docker (`curl -fsSL https://get.tend.host/compose.yml -o compose.yml && docker compose up -d`).
+    It pins the panel image by version and digest, is signed under its own prefix
+    (`tend-install-compose-v1`) and appears only for a stable release whose image carries
+    `compose.yml.tmpl`. Beta never changes it.
   - `tend-panel-release-1.pub.pem`: the release public key.
   - `v1/stable.json`, `v1/beta.json` and their `.sig`: the signed channel manifests.
     Each pins the panel image `ghcr.io/tend-stack/tend-host` by digest and the
@@ -40,6 +45,15 @@ openssl pkeyutl -verify -pubin -inkey tend-panel-release-1.pub.pem -rawin -in me
 less install.sh
 sudo bash install.sh
 ```
+
+The Compose file is checked in one line, with the prefix `tend-install-compose-v1`:
+
+```bash
+curl -fsSLO https://get.tend.host/compose.yml.sig && curl -fsSLO https://get.tend.host/tend-panel-release-1.pub.pem && (printf 'tend-install-compose-v1\n'; cat compose.yml) > m && base64 -d compose.yml.sig > s && openssl pkeyutl -verify -pubin -inkey tend-panel-release-1.pub.pem -rawin -in m -sigfile s && rm m s
+```
+
+Then compare the key with the SPKI printed in the docs
+(`MCowBQYDK2VwAyEA6mqh9euEIZV1KSTZzWBJ8xaluXkPBt5GGg+CuNLbuBM=`).
 
 A manifest is checked the same way, using the prefix `tend-panel-release-v1`
 instead of `tend-install-script-v1`. Also check its `expires_at` and its

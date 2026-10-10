@@ -16,6 +16,12 @@
 # public key and min-upgrade-from are read from /srv/scripts/install/ inside
 # its linux/amd64 image. Nothing here needs a credential except `sign`.
 #
+# compose.yml (docs/strategy/compose-install-plan.md): when a new stable image
+# carries /srv/scripts/install/compose.yml.tmpl, `sign` renders it with the image
+# reference and digest, signs it under its own domain (tend-install-compose-v1)
+# into compose.yml.sig, and verifies it. Beta never touches it; a re-sign keeps the published
+# pair, which must verify; a new stable release without the template removes the pair.
+#
 # Rules: stable takes the highest version without a prerelease part; beta takes
 # the highest version of all, so a beta tag can never move stable.json. A
 # channel never goes back to a lower version, and a version tag that now names
@@ -56,7 +62,11 @@ RESIGN_AFTER=$((7 * 24 * 3600))
 PLATFORMS=(linux/amd64 linux/arm64)
 CHANNELS=(stable beta)
 WANT=(install.sh install-panel.sh tend-panel-release-1.pub.pem min-upgrade-from)
+OPTIONAL=(compose.yml.tmpl)
 SCRIPT_DOMAIN="tend-install-script-v1"
+COMPOSE_DOMAIN="tend-install-compose-v1"
+COMPOSE_MARKER="# tend-compose-install: v1"
+COMPOSE_MAX=16384
 RE_VERSION='^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})(-(alpha|beta|rc)\.(0|[1-9][0-9]{0,5}))?$'
 RE_HEX40='^[0-9a-f]{40}$'
 RE_HEX64='^[0-9a-f]{64}$'
@@ -178,7 +188,7 @@ inspect_release() {
   mkdir -p "$dir"
   # Top layer first: the first copy found is the one the image shows.
   found=0
-  for ((i = $(jq '.layers | length' "$work/image.json") - 1; i >= 0 && found < ${#WANT[@]}; i--)); do
+  for ((i = $(jq '.layers | length' "$work/image.json") - 1; i >= 0 && found < ${#WANT[@]} + ${#OPTIONAL[@]}; i--)); do
     layer="$(jq -r ".layers[$i].digest" "$work/image.json")"
     mt="$(jq -r ".layers[$i].mediaType" "$work/image.json")"
     [[ $layer =~ $RE_DIGEST ]] || die "bad layer digest in $version."
@@ -191,7 +201,7 @@ inspect_release() {
       *tar) tar -xf "$work/layer" -C "$work/x" --wildcards --no-same-owner 'srv/scripts/install/*' 2> /dev/null || true ;;
       *) die "unsupported layer type $mt." ;;
     esac
-    for f in "${WANT[@]}"; do
+    for f in "${WANT[@]}" "${OPTIONAL[@]}"; do
       if [[ ! -e $dir/$f && -f $work/x/srv/scripts/install/$f && ! -L $work/x/srv/scripts/install/$f ]]; then
         cp "$work/x/srv/scripts/install/$f" "$dir/$f"
         found=$((found + 1))
@@ -401,6 +411,7 @@ cmd_plan() {
           echo "${ch}_action=release"
           echo "${ch}_version=$cand" "${ch}_digest=$(candidate_get "$out/$ch" digest)" "${ch}_revision=$(candidate_get "$out/$ch" revision)" "${ch}_min=$(candidate_get "$out/$ch" min)"
           say "$ch: release $cand ($(candidate_get "$out/$ch" digest), revision $(candidate_get "$out/$ch" revision))${C_VERSION:+, replacing $C_VERSION}"
+          if [[ -f $out/$ch/compose.yml.tmpl ]]; then say "$ch: compose template present"; else say "$ch: compose template absent"; fi
           released=1 any=1
         fi
       elif [[ -n $cand && $cand == "$C_VERSION" ]]; then
@@ -487,8 +498,36 @@ script_signature_ok() {
   return 1
 }
 
+# render_compose <tmpl> <version> <digest> <out>: the compose.yml of one release. The version and
+# digest were checked against RE_VERSION and RE_DIGEST by the caller.
+render_compose() {
+  local tmpl="$1" version="$2" digest="$3" out="$4" ref
+  [[ $version =~ $RE_VERSION && $digest =~ $RE_DIGEST ]] || die "compose: bad version or digest."
+  ref="$IMAGE:$version@$digest"
+  sed -e "s|@TEND_IMAGE_REF@|$ref|g" -e "s|@TEND_VERSION@|$version|g" "$tmpl" > "$out"
+  ! grep -q '@TEND_' "$out" || die "compose.yml.tmpl has a placeholder this tool does not know."
+  [[ "$(head -n 1 "$out")" == "$COMPOSE_MARKER" ]] || die "compose.yml.tmpl does not start with '$COMPOSE_MARKER'."
+  (($(wc -c < "$out") <= COMPOSE_MAX)) || die "compose.yml is larger than $COMPOSE_MAX bytes."
+}
+
+# compose_signature_ok <site> <scratch dir>: site/compose.yml.sig is a valid signature (by the
+# release key; in a dry run also the throwaway one) over "$COMPOSE_DOMAIN\n" + compose.yml.
+compose_signature_ok() {
+  local site="$1" tmp="$2" spki
+  [[ -f $site/compose.yml && -f $site/compose.yml.sig ]] || return 1
+  { printf '%s\n' "$COMPOSE_DOMAIN"; cat "$site/compose.yml"; } > "$tmp/compose.msg"
+  base64 -d "$site/compose.yml.sig" > "$tmp/compose.sig" 2> /dev/null || return 1
+  for spki in "${ACCEPT_SPKIS[@]}"; do
+    printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "$spki" > "$tmp/compose.pub"
+    if openssl pkeyutl -verify -pubin -inkey "$tmp/compose.pub" -rawin -in "$tmp/compose.msg" -sigfile "$tmp/compose.sig" > /dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 cmd_sign() {
-  local site="" plan="" now key spki keyid ch action version digest revision min sha url published expires replaced=0
+  local site="" plan="" now key spki keyid ch action version digest revision min sha url published expires replaced=0 composed=0
   now="$(date +%s)"
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -545,6 +584,21 @@ cmd_sign() {
       cp "$plan/$ch/tend-panel-release-1.pub.pem" "$site/tend-panel-release-1.pub.pem"
       replaced=1
     fi
+    if [[ $ch == stable && $action == release && -f $plan/stable/compose.yml.tmpl ]]; then
+      render_compose "$plan/stable/compose.yml.tmpl" "$version" "$digest" "$site/compose.yml.new"
+      sign_file "$key" "$COMPOSE_DOMAIN" "$site/compose.yml.new" "$site/compose.yml.sig.new"
+      mkdir -p "$KEYDIR/cv" && cp "$site/compose.yml.new" "$KEYDIR/cv/compose.yml" && cp "$site/compose.yml.sig.new" "$KEYDIR/cv/compose.yml.sig"
+      compose_signature_ok "$KEYDIR/cv" "$KEYDIR" || die "stable: the compose.yml just signed does not verify."
+      mv "$site/compose.yml.new" "$site/compose.yml"
+      mv "$site/compose.yml.sig.new" "$site/compose.yml.sig"
+      composed=1
+    elif [[ $ch == stable && $action == release ]]; then
+      # The new digest would not match the published pin: absence is accepted by vendoring, a mismatch is not.
+      if [[ -f $site/compose.yml || -f $site/compose.yml.sig ]]; then
+        rm -f "$site/compose.yml" "$site/compose.yml.sig"
+        say "stable $version has no compose template; removed compose.yml so get.tend.host stays consistent"
+      fi
+    fi
     say "$ch: signed $version ($action), expires $(date -u -d "@$expires" +%Y-%m-%dT%H:%MZ)"
   done
   [[ -f $site/install.sh ]] || die "no install.sh to publish yet."
@@ -557,6 +611,10 @@ cmd_sign() {
   else
     # A re-sign never signs install.sh: the signature already there must verify, and stays.
     script_signature_ok "$site" "$KEYDIR" || die "site/install.sh does not verify with install.sh.sig; fix it by hand."
+  fi
+  # Without a new template the compose.yml already published stays, and must still verify.
+  if ((!composed)) && [[ -f $site/compose.yml || -f $site/compose.yml.sig ]]; then
+    compose_signature_ok "$site" "$KEYDIR" || die "site/compose.yml does not verify with compose.yml.sig; fix it by hand."
   fi
   rm -f "$key"
   # Only the stage 1 files a channel names stay on the site; releases keep the rest.
@@ -603,7 +661,7 @@ cmd_publish() {
     fi
   done
   # The rolling release is what stage 0 falls back to (releases/latest/download/<file>).
-  for f in install.sh install.sh.sha256 install.sh.sig tend-panel-release-1.pub.pem SHA256SUMS v1/*.json v1/*.json.sig v1/install-panel-*.sh; do
+  for f in install.sh install.sh.sha256 install.sh.sig compose.yml compose.yml.sig tend-panel-release-1.pub.pem SHA256SUMS v1/*.json v1/*.json.sig v1/install-panel-*.sh; do
     for g in "$site"/$f; do [[ -f $g ]] && files+=("$g"); done
   done
   gh release view channels > /dev/null 2>&1 ||
