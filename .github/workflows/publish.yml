@@ -158,7 +158,9 @@ jobs:
   sign:
     name: Sign and publish
     needs: plan
-    if: needs.plan.outputs.sign == '1' && !inputs.dry_run && github.ref == 'refs/heads/main'
+    # !cancelled(): plan's own upstream (copy) may be skipped or failed; a broken copy
+    # must never block a re-sign, so judge only plan's result here.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.sign == '1' && !inputs.dry_run && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -232,7 +234,7 @@ jobs:
   dry_run:
     name: Dry run (throwaway key)
     needs: plan
-    if: inputs.dry_run
+    if: ${{ !cancelled() && needs.plan.result == 'success' && inputs.dry_run }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
