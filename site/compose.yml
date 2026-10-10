@@ -1,0 +1,99 @@
+# tend-compose-install: v1
+# Tend 0.11.4. Start: docker compose up -d
+# Open: http://127.0.0.1:8787 (on a server: ssh -L 8787:127.0.0.1:8787 you@server)
+# Setup code: docker compose exec tend-host tend setup-code
+# Settings go in .env next to this file: TEND_PORT, TEND_BIND, TEND_DOMAIN, COMPOSE_PROFILES=https.
+# Tend writes TEND_IMAGE into .env when it updates itself: keep .env and that line.
+name: tend
+
+services:
+  tend-host:
+    image: "${TEND_IMAGE:-ghcr.io/tend-stack/tend-host:0.11.4@sha256:0e70d9a01106a1886d55eef9eaabd763ac765b603a8c5b1aee3ebd0699cd62ce}"
+    container_name: tend-host
+    restart: unless-stopped
+    ports:
+      - "${TEND_BIND:-127.0.0.1}:${TEND_PORT:-8787}:8787"
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8787"
+      LOG_LEVEL: INFO
+      TEND_HOST_DATA_DIR: /srv/data
+      TEND_INSTALL_KIND: compose
+      TEND_COMPOSE_PORT: "${TEND_PORT:-8787}"
+      TEND_CADDY_ADMIN_URL: "${TEND_DOMAIN:+http://172.31.255.3:2019}"
+      TEND_PANEL_UPSTREAM: "${TEND_DOMAIN:+172.31.255.2:8787}"
+      TEND_TRUSTED_PROXIES: "${TEND_DOMAIN:+172.31.255.3}"
+      TEND_INSTALL_PROFILE: "${TEND_DOMAIN:+vps}"
+      TEND_SEED_PANEL_ADDRESS: "${TEND_DOMAIN:-}"
+      TEND_SELF_UPDATE_MODE: channel
+      TEND_UPDATE_CHANNEL: "${TEND_UPDATE_CHANNEL:-stable}"
+      TEND_HOST_EXEC_IMAGE: "${TEND_IMAGE:-ghcr.io/tend-stack/tend-host:0.11.4@sha256:0e70d9a01106a1886d55eef9eaabd763ac765b603a8c5b1aee3ebd0699cd62ce}"
+    volumes:
+      - tend-data:/srv/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      edge: {}
+      control:
+        ipv4_address: 172.31.255.2
+      tend-net: {}
+
+  caddy:
+    profiles: ["https"]
+    image: caddy:2-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
+    container_name: tend-caddy
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+      - "0.0.0.0:443:443/udp"
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - tend-host
+    networks:
+      edge: {}
+      control:
+        ipv4_address: 172.31.255.3
+      tend-net: {}
+
+configs:
+  caddyfile:
+    content: |
+      {
+          admin 172.31.255.3:2019
+          skip_install_trust
+      }
+
+      (panel) {
+          reverse_proxy 172.31.255.2:8787 {
+              flush_interval -1
+          }
+          encode gzip
+      }
+
+      ${TEND_DOMAIN:-localhost} {
+          import panel
+      }
+
+volumes:
+  tend-data:
+    name: tend-data
+  caddy-data:
+    name: tend-caddy-data
+  caddy-config:
+    name: tend-caddy-config
+
+networks:
+  edge:
+    driver: bridge
+  control:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.255.0/29
+  tend-net:
+    name: tend-net
