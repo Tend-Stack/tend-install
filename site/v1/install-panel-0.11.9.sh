@@ -987,6 +987,33 @@ install_base_packages() {
   c_ok "Base tools are in place"
 }
 
+# One rule per call: firewalld 2.x (Rocky/RHEL 10) refuses --add-port and
+# --add-service in the same command, which older releases accepted.
+open_firewalld_ports() {
+  local ssh_port="$1"
+  firewall-cmd --permanent --add-port="${ssh_port}/tcp" > /dev/null
+  firewall-cmd --permanent --add-service=http > /dev/null
+  firewall-cmd --permanent --add-service=https > /dev/null
+  firewall-cmd --permanent --add-port=443/udp > /dev/null
+  # Rocky/RHEL images allow the cockpit web console by default; Tend promises only SSH, 80 and 443.
+  firewall-cmd --permanent --remove-service=cockpit > /dev/null 2>&1 || true
+  firewall-cmd --reload > /dev/null
+  restart_fail2ban_if_running
+}
+
+# fail2ban's firewallcmd actions add RUNTIME rich rules, and `firewall-cmd --reload` drops every
+# runtime rule: fail2ban would still list its bans while nothing enforces them. Restarting it
+# makes it apply the stored bans again. Call this after every firewalld reload.
+restart_fail2ban_if_running() {
+  systemctl is-active --quiet fail2ban 2> /dev/null || return 0
+  systemctl restart fail2ban > /dev/null 2>&1 || true
+}
+
+# Paths harden_vps writes, overridable so the tests never touch the real ones.
+F2B_JAIL_LOCAL="${F2B_JAIL_LOCAL:-/etc/fail2ban/jail.local}"
+DNF_AUTOMATIC_CONF="${DNF_AUTOMATIC_CONF:-/etc/dnf/automatic.conf}"
+APT_UNATTENDED_CONF="${APT_UNATTENDED_CONF:-/etc/apt/apt.conf.d/52tend-host-unattended}"
+
 harden_vps() {
   [[ $SKIP_HARDENING != 1 ]] || { c_step "Skipping hardening (SKIP_HARDENING=1)"; return 0; }
   c_step "Hardening this server"
@@ -995,18 +1022,17 @@ harden_vps() {
   if [[ $OS_FAMILY == debian ]]; then
     apt_install unattended-upgrades apt-listchanges fail2ban ufw
     printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\nUnattended-Upgrade::Automatic-Reboot "true";\nUnattended-Upgrade::Automatic-Reboot-Time "03:00";\n' \
-      > /etc/apt/apt.conf.d/52tend-host-unattended
+      > "$APT_UNATTENDED_CONF"
     systemctl enable --now unattended-upgrades.service 2> /dev/null || true
   else
     dnf_install dnf-automatic epel-release || true
     dnf_install fail2ban firewalld || true
-    sed -i 's/^apply_updates =.*/apply_updates = yes/' /etc/dnf/automatic.conf
+    sed -i 's/^apply_updates =.*/apply_updates = yes/' "$DNF_AUTOMATIC_CONF"
     systemctl enable --now dnf-automatic.timer
   fi
   record "Unattended security upgrades (auto-reboot 03:00 if the kernel changes)"
-  printf '[DEFAULT]\nbantime = 1h\nfindtime = 10m\nmaxretry = 5\nignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16\n\n[sshd]\nenabled = true\n' > /etc/fail2ban/jail.local
-  systemctl enable --now fail2ban; systemctl restart fail2ban
-  record "fail2ban on SSH (5 failures in 10 minutes bans for 1 hour)"
+  printf '[DEFAULT]\nbantime = 1h\nfindtime = 10m\nmaxretry = 5\nignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16\n\n[sshd]\nenabled = true\n' > "$F2B_JAIL_LOCAL"
+  # The firewall comes first and fail2ban starts after it, so no reload can drop a ban it applied.
   if [[ $OS_FAMILY == debian ]]; then
     if ! ufw status 2> /dev/null | grep -q '^Status: active'; then ufw default deny incoming > /dev/null; ufw default allow outgoing > /dev/null; fi
     ufw allow "${ssh_port}/tcp" comment 'SSH' > /dev/null
@@ -1014,11 +1040,12 @@ harden_vps() {
     ufw --force enable > /dev/null
   else
     systemctl enable --now firewalld
-    firewall-cmd --permanent --add-port="${ssh_port}/tcp" --add-service=http --add-service=https > /dev/null
-    firewall-cmd --permanent --add-port=443/udp > /dev/null; firewall-cmd --reload > /dev/null
+    open_firewalld_ports "$ssh_port"
   fi
   c_ok "Firewall on: SSH ($ssh_port), 80 and 443 open; everything else closed"
   record "Firewall: SSH ${ssh_port}, 80, 443 only (Tend's own port 8787 is not published at all)"
+  systemctl enable --now fail2ban; systemctl restart fail2ban
+  record "fail2ban on SSH (5 failures in 10 minutes bans for 1 hour)"
 }
 
 # ---- SSH: offer to turn password logins off ------------------------------------
@@ -1082,7 +1109,14 @@ journal_has_publickey() {
   out="$(journalctl -u ssh -u sshd --since '1 hour ago' --no-pager -q -o cat 2> /dev/null)" || out=""
   [[ $out == *"Accepted publickey for $1 from $2 port"* ]]
 }
-ssh_reload() { systemctl reload ssh 2> /dev/null || systemctl reload sshd 2> /dev/null; }
+# SSH_UNIT remembers which name reloaded ("ssh" on Debian/Ubuntu, "sshd" on Rocky/RHEL/Fedora)
+# so the undo line names the right one.
+SSH_UNIT=ssh
+ssh_reload() {
+  if systemctl reload ssh 2> /dev/null; then SSH_UNIT=ssh; return 0; fi
+  if systemctl reload sshd 2> /dev/null; then SSH_UNIT=sshd; return 0; fi
+  return 1
+}
 # ssh_undo MODE FILE BACKUP: put the SSH configuration back as it was before ssh_apply_keys_only.
 ssh_undo() {
   if [[ $1 == dropin ]]; then if [[ -n $3 ]]; then cat "$3" > "$2"; else rm -f "$2"; fi
@@ -1169,8 +1203,8 @@ ssh_keys_only_step() {
   fi
   if ssh_apply_keys_only; then
     SSH_STATE=off
-    if [[ $SSH_FILE == "$SSHD_CONFIG" ]]; then undo_text="restore $SSHD_CONFIG.tend-bak, then: sudo systemctl reload ssh"
-    else undo_text="sudo rm $SSH_FILE && sudo systemctl reload ssh"; fi
+    if [[ $SSH_FILE == "$SSHD_CONFIG" ]]; then undo_text="restore $SSHD_CONFIG.tend-bak, then: sudo systemctl reload $SSH_UNIT"
+    else undo_text="sudo rm $SSH_FILE && sudo systemctl reload $SSH_UNIT"; fi
     c_ok "SSH password logins are off. Your key still works."
     echo "        To undo: $undo_text"
     record "SSH: keys only, password logins off (undo: $undo_text)"
