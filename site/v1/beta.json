@@ -1,6 +1,6 @@
 {
   "channel": "beta",
-  "expires_at": 1794323523,
+  "expires_at": 1794973452,
   "image": "ghcr.io/tend-stack/tend-host",
   "image_digest": "sha256:a3ffaa82c0b68f3650c68d73f6dbd7f480ac3da7f8f8c31c58753399d639f138",
   "installer_sha256": "124c7d8f5522cf4f05e7f6cbaf8ba311da937f42b2f9edc977ecd6ca72148622",
@@ -8,7 +8,7 @@
   "key_id": "a11d1c3fe5f86c14",
   "min_upgrade_from": "0.10.0",
   "platforms": ["linux/amd64", "linux/arm64"],
-  "published_at": 1791731523,
+  "published_at": 1792381452,
   "revision": "1f2633467338de5b3a8255dec81ecb15df159675",
   "schema": 1,
   "version": "0.11.9"
