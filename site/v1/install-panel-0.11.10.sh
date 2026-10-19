@@ -294,7 +294,7 @@ render_caddyfile() {
   # shellcheck disable=SC2016  # {$VAR} is Caddy's own placeholder
   printf '{\n\tadmin {$TEND_CADDY_CONTROL_IP}:2019\n\tskip_install_trust\n'
   [[ -z $email ]] || printf '\temail %s\n' "$email"
-  printf '}\n\n(panel) {\n\treverse_proxy %s:8787 {\n\t\tflush_interval -1\n\t}\n\tencode gzip\n}\n\n' "$PANEL_CONTROL_IP"
+  printf '}\n\n(panel) {\n\treverse_proxy %s:8787 {\n\t\tflush_interval -1\n\t\tunhealthy_request_count 1024\n\t}\n\tencode gzip\n}\n\n' "$PANEL_CONTROL_IP"
   if [[ $profile == vps ]]; then
     printf '%s {\n\timport panel\n}\n' "$fqdn"
     if is_ipv4 "$ips"; then printf '\nhttp://%s {\n\tredir https://%s{uri} 308\n}\n' "$ips" "$fqdn"; fi
@@ -1026,7 +1026,9 @@ harden_vps() {
     systemctl enable --now unattended-upgrades.service 2> /dev/null || true
   else
     dnf_install dnf-automatic epel-release || true
-    dnf_install fail2ban firewalld || true
+    # The fail2ban metapackage also pulls fail2ban-sendmail, which installs an MTA (exim on EPEL 10):
+    # a set-user-id binary and a mail server Tend never uses. Install only the parts the jail needs.
+    dnf_install fail2ban-server fail2ban-firewalld fail2ban-selinux firewalld || true
     sed -i 's/^apply_updates =.*/apply_updates = yes/' "$DNF_AUTOMATIC_CONF"
     systemctl enable --now dnf-automatic.timer
   fi
