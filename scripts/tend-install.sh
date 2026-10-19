@@ -647,7 +647,16 @@ cmd_publish() {
   if git diff --cached --quiet; then say "nothing changed on the site."; else
     git -c user.name="tend-install" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
       commit -q -m "release: $(tr '\n' ' ' < "$plan/plan.env" | sed 's/now=[0-9]* //')"
-    git push -q origin HEAD:main
+    # A push rejected because main moved on (a newer run published first) is not a
+    # failure of this run: the plan is stale, the next run plans again.
+    if ! git push -q origin HEAD:main; then
+      git fetch -q origin main 2> /dev/null || true
+      if [[ -n "$(git rev-parse -q --verify FETCH_HEAD)" ]] && ! git merge-base --is-ancestor FETCH_HEAD HEAD; then
+        say "main moved on while this run was signing; nothing published. The next run plans again."
+        exit 0
+      fi
+      die "git push to main failed."
+    fi
   fi
   for ch in "${CHANNELS[@]}"; do
     action="$(plan_get "$plan" "${ch}_action")" version="$(plan_get "$plan" "${ch}_version")"

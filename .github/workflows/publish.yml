@@ -28,6 +28,12 @@ name: Sign and publish the install channels
 # A refused release or a failed copy never blocks the re-sign of what is
 # published.
 #
+# After a publish that changed site/, the sign job asks the SaaS repository (Gitea
+# Rubirosa/tend-host-saas) to vendor it at once instead of waiting for its hourly
+# cron (secret SAAS_PIN_BUMP_TOKEN; absent means a notice and no dispatch).
+# A run that was queued behind the release approval and finds main moved on
+# stops cleanly: it never signs from a stale plan and never fails at push.
+#
 # Manual run with dry_run: no copy; plans and signs with a throwaway key
 # generated in the run, verifies the result exactly as install.sh would,
 # publishes nothing, and never touches the release environment.
@@ -172,21 +178,75 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ssh-key: ${{ secrets.TEND_INSTALL_DEPLOY_KEY }}
+      # A scheduled run is queued behind the `release` approval; when it is finally
+      # approved, a newer run may already have published, and this run's plan (made
+      # from the commit it was queued at) is stale. Signing and pushing it would be
+      # rejected ("fetch first") or, worse, re-sign over newer work. Stop cleanly
+      # instead: the next scheduled run plans again from the current main.
+      - name: Stop if main moved since this run was queued
+        id: fresh
+        run: |
+          set -euo pipefail
+          git fetch -q origin main
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
+            echo "::notice::main moved on ($(git rev-parse --short HEAD) -> $(git rev-parse --short FETCH_HEAD)) while this run waited; skipping it. The next scheduled run plans from the current main."
+            echo "stale=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=0" >> "$GITHUB_OUTPUT"
+          fi
       - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        if: steps.fresh.outputs.stale == '0'
         with:
           cosign-release: v2.4.1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: steps.fresh.outputs.stale == '0'
         with:
           name: plan
           path: ${{ runner.temp }}/plan
       - name: Sign the channel manifests and install.sh
+        if: steps.fresh.outputs.stale == '0'
         env:
           TEND_PANEL_RELEASE_KEY: ${{ secrets.TEND_PANEL_RELEASE_KEY }}
         run: scripts/tend-install.sh sign --site site --plan "$RUNNER_TEMP/plan"
       - name: Commit site/ and refresh the releases
+        id: publish
+        if: steps.fresh.outputs.stale == '0'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/tend-install.sh publish --site site --plan "$RUNNER_TEMP/plan"
+        run: |
+          set -euo pipefail
+          before="$(git rev-parse HEAD)"
+          scripts/tend-install.sh publish --site site --plan "$RUNNER_TEMP/plan"
+          # Changed means: a commit was made and it reached main (a push lost to a
+          # newer run exits above without publishing, and is not "changed").
+          git fetch -q origin main
+          if [ "$(git rev-parse HEAD)" != "$before" ] && git merge-base --is-ancestor HEAD FETCH_HEAD; then
+            echo "changed=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+          fi
+      # Instant path: ask the SaaS repository to vendor the new site/ now rather
+      # than at its next hourly cron (:41). Best effort by design: a missing
+      # secret or a failed call is a notice, never a failed publish; the cron is
+      # the fallback.
+      - name: Trigger the SaaS install pin bump
+        if: steps.publish.outputs.changed == '1'
+        env:
+          SAAS_PIN_BUMP_TOKEN: ${{ secrets.SAAS_PIN_BUMP_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${SAAS_PIN_BUMP_TOKEN:-}" ]; then
+            echo "::notice::SAAS_PIN_BUMP_TOKEN is not set; the SaaS pin bump runs at its next hourly cron (:41)."
+            exit 0
+          fi
+          url="https://j.santanafam.com/api/v1/repos/Rubirosa/tend-host-saas/actions/workflows/install-pin-bump.yml/dispatches"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST \
+            -H "Authorization: token ${SAAS_PIN_BUMP_TOKEN}" -H 'Content-Type: application/json' \
+            -d '{"ref":"main"}' "$url" 2> /dev/null || true)"
+          case "$code" in
+            2??) echo "SaaS install-pin-bump dispatched (HTTP $code)." ;;
+            *) echo "::notice::SaaS install-pin-bump dispatch did not succeed (HTTP ${code:-none}); the hourly cron will pick the release up." ;;
+          esac
 
   alert:
     name: Open issues for refusals and failures
