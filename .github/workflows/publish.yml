@@ -31,6 +31,9 @@ name: Sign and publish the install channels
 # After a publish that changed site/, the sign job asks the SaaS repository (Gitea
 # Rubirosa/tend-host-saas) to vendor it at once instead of waiting for its hourly
 # cron (secret SAAS_PIN_BUMP_TOKEN; absent means a notice and no dispatch).
+# A newer run supersedes an older run that is only waiting for the `release`
+# approval (plan job, "Supersede older runs"); a run that is signing or pushing
+# is never cancelled.
 # A run that was queued behind the release approval and finds main moved on
 # stops cleanly: it never signs from a stale plan and never fails at push.
 #
@@ -55,9 +58,12 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: publish-install-channels
-  cancel-in-progress: false
+# No workflow-level concurrency group. A run that sat in `waiting` for the
+# `release` approval held that group and left every newer run (a release
+# dispatch included) pending behind it. Serialisation is per job instead:
+# `copy` and `sign` each have a group (never cancel-in-progress, so a job that
+# is copying or signing always finishes), and the plan job cancels older runs
+# whose sign job is still waiting for approval before this run asks for its own.
 
 jobs:
   copy:
@@ -68,6 +74,9 @@ jobs:
     # for GITHUB_TOKEN could not be made (plan, D5); without that secret the
     # token is used for both registries.
     environment: image-copy
+    concurrency:
+      group: publish-install-copy
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -126,6 +135,9 @@ jobs:
     # A copy that refused or failed never blocks a re-sign.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: write # cancel older runs that only wait for approval
     outputs:
       sign: ${{ steps.plan.outputs.sign }}
       refused: ${{ steps.plan.outputs.refused }}
@@ -155,6 +167,32 @@ jobs:
             echo '```'
             if [ "$refused" = 1 ]; then echo "A release was refused: the alert job opens an issue."; fi
           } >> "$GITHUB_STEP_SUMMARY"
+      # Older runs of this workflow whose only remaining work is the sign job
+      # waiting for the `release` approval are superseded by this run: its plan is
+      # fresher, and it needs the sign group they hold. A run with any job in
+      # progress or queued (signing, pushing, copying) is left alone. Best effort:
+      # a failure here is a notice, and the old run can still be cancelled by hand.
+      - name: Supersede older runs that only wait for approval
+        if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          THIS_RUN: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          ids="$(gh api "repos/$GH_REPO/actions/workflows/publish.yml/runs?status=waiting&per_page=50" --jq '.workflow_runs[].id' 2> /dev/null)" || { echo "::notice::could not list waiting runs; skipping supersede."; exit 0; }
+          for id in $ids; do
+            [ "$id" -lt "$THIS_RUN" ] || continue
+            jobs="$(gh api "repos/$GH_REPO/actions/runs/$id/jobs?per_page=50" --jq '[.jobs[] | select(.status=="in_progress" or .status=="queued")] | length' 2> /dev/null)" || continue
+            waits="$(gh api "repos/$GH_REPO/actions/runs/$id/jobs?per_page=50" --jq '[.jobs[] | select(.name=="Sign and publish" and .status=="waiting")] | length' 2> /dev/null)" || continue
+            if [ "$jobs" = 0 ] && [ "$waits" = 1 ]; then
+              if gh api -X POST "repos/$GH_REPO/actions/runs/$id/cancel" > /dev/null 2>&1; then
+                echo "::notice::cancelled run $id, superseded by $THIS_RUN (it only waited for the release approval)."
+              else
+                echo "::notice::could not cancel waiting run $id."
+              fi
+            fi
+          done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: plan
@@ -169,6 +207,9 @@ jobs:
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.sign == '1' && !inputs.dry_run && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     environment: release
+    concurrency:
+      group: publish-install-sign
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
