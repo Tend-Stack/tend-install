@@ -699,10 +699,43 @@ public_digest() {
   rm -f "$f"
 }
 
+# oras_retry <what> <command...>: run an oras command against the private package. Right after
+# a push the registry can answer "not found" for a manifest or blob that exists a minute later
+# (v0.11.14: the copy ran the second release.yml finished and a platform manifest was missing).
+# Only a not-found answer is transient and retried with backoff for TEND_COPY_RETRY_SECONDS
+# (default 300); any other error, and a not-found that outlasts the window, returns the failure
+# at once. Stdout of the successful run is passed through byte-exact.
+oras_retry() {
+  local what="$1" window="${TEND_COPY_RETRY_SECONDS:-300}" wait="${TEND_COPY_RETRY_INTERVAL:-5}" waited=0 errf outf rc
+  shift
+  errf="$(mktemp)"
+  outf="$(mktemp)"
+  while :; do
+    set +e
+    "$@" > "$outf" 2> "$errf"
+    rc=$?
+    set -e
+    if ((rc == 0)); then
+      cat "$outf"
+      rm -f "$errf" "$outf"
+      return 0
+    fi
+    cat "$errf" >&2
+    if ! grep -qiE 'not found|MANIFEST_UNKNOWN|BLOB_UNKNOWN|NAME_UNKNOWN|: 404' "$errf" || ((waited >= window)); then
+      rm -f "$errf" "$outf"
+      return "$rc"
+    fi
+    say "$what: not found yet (the registry is still settling); retrying in ${wait}s (${waited}s of ${window}s used)."
+    sleep "$wait"
+    waited=$((waited + wait))
+    wait=$((wait * 2 > 30 ? 30 : wait * 2))
+  done
+}
+
 # oras_resolve <reference>: the digest <reference> names in the private package.
 oras_resolve() {
   local d
-  d="$(oras resolve "${ORAS_PLAIN[@]}" --registry-config "$TEND_COPY_FROM_CONFIG" "$1")" || die "cannot read $1."
+  d="$(oras_retry "resolve $1" oras resolve "${ORAS_PLAIN[@]}" --registry-config "$TEND_COPY_FROM_CONFIG" "$1")" || die "cannot read $1."
   [[ $d =~ $RE_DIGEST ]] || die "$1 resolved to something that is not a digest."
   printf '%s' "$d"
 }
@@ -714,11 +747,11 @@ copy_one() {
   work="$(mktemp -d)"
   p_digest="$(oras_resolve "$SOURCE_IMAGE:proof-$v")"
   d_digest="$(oras_resolve "$SOURCE_IMAGE:$v")"
-  oras manifest fetch "${ORAS_PLAIN[@]}" --registry-config "$TEND_COPY_FROM_CONFIG" "$SOURCE_IMAGE@$p_digest" > "$work/manifest.json" ||
+  oras_retry "read proof-$v" oras manifest fetch "${ORAS_PLAIN[@]}" --registry-config "$TEND_COPY_FROM_CONFIG" "$SOURCE_IMAGE@$p_digest" > "$work/manifest.json" ||
     die "cannot read proof-$v."
   [[ "sha256:$(sha256_of "$work/manifest.json")" == "$p_digest" ]] || die "the registry returned another manifest for proof-$v."
   proof_manifest_ok "$work/manifest.json" "$v"
-  oras pull "${ORAS_PLAIN[@]}" --registry-config "$TEND_COPY_FROM_CONFIG" -o "$work/proof" "$SOURCE_IMAGE@$p_digest" > /dev/null ||
+  oras_retry "pull proof-$v" oras pull "${ORAS_PLAIN[@]}" --registry-config "$TEND_COPY_FROM_CONFIG" -o "$work/proof" "$SOURCE_IMAGE@$p_digest" > /dev/null ||
     die "cannot pull proof-$v."
   [[ "$(find "$work/proof" -mindepth 1 | wc -l)" -eq 3 ]] || die "proof-$v pulled more or fewer than three files."
   for title in "${PROOF_FILES[@]}"; do
@@ -734,12 +767,12 @@ copy_one() {
   pub_p="$(public_digest "proof-$v")"
   [[ -z $pub_p || $pub_p == "$p_digest" ]] || die "the public proof-$v already names another artifact."
   if [[ -z $pub_p ]]; then
-    oras cp "${ORAS_FROM_PLAIN[@]}" "${ORAS_TO_PLAIN[@]}" --from-registry-config "$TEND_COPY_FROM_CONFIG" --to-registry-config "$TEND_COPY_TO_CONFIG" \
+    oras_retry "copy proof-$v" oras cp "${ORAS_FROM_PLAIN[@]}" "${ORAS_TO_PLAIN[@]}" --from-registry-config "$TEND_COPY_FROM_CONFIG" --to-registry-config "$TEND_COPY_TO_CONFIG" \
       "$SOURCE_IMAGE@$p_digest" "$IMAGE:proof-$v" > /dev/null || die "cannot copy proof-$v."
     say "copied proof-$v"
   fi
   if [[ -z $pub_v ]]; then
-    oras cp "${ORAS_FROM_PLAIN[@]}" "${ORAS_TO_PLAIN[@]}" --from-registry-config "$TEND_COPY_FROM_CONFIG" --to-registry-config "$TEND_COPY_TO_CONFIG" \
+    oras_retry "copy $v" oras cp "${ORAS_FROM_PLAIN[@]}" "${ORAS_TO_PLAIN[@]}" --from-registry-config "$TEND_COPY_FROM_CONFIG" --to-registry-config "$TEND_COPY_TO_CONFIG" \
       "$SOURCE_IMAGE@$d_digest" "$IMAGE:$v" > /dev/null || die "cannot copy $v."
     say "copied $v"
   fi
