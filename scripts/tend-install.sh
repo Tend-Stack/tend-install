@@ -857,15 +857,16 @@ raise_issue() {
   say "opened an issue: $1"
 }
 
-# alert --plan <dir> [--failed] [--code-change <sha>]: one issue per line of <dir>/refusals.tsv
+# alert --plan <dir> [--failed] [--code-change <sha>] [--approval-unused <reason>]: one issue per line of <dir>/refusals.tsv
 # and <dir>/copy-refusals.tsv (`<phase>\t<channel|->\t<version>\t<reason>`), one for a failed run,
 # one for a code change on main. Works without a plan directory.
 cmd_alert() {
-  local plan="" failed=0 code="" phase ch version reason run="" file title body
+  local plan="" failed=0 code="" unused="" phase ch version reason run="" file title body
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --plan) plan="$2"; shift 2 ;; --failed) failed=1; shift ;;
       --code-change) code="$2"; shift 2 ;;
+      --approval-unused) unused="$2"; shift 2 ;;
       *) die "unknown option $1" ;;
     esac
   done
@@ -891,12 +892,47 @@ cmd_alert() {
   if ((failed)); then
     raise_issue "Install channel workflow failed" "The install channel workflow failed, so nothing new was signed. Published manifests expire 30 days after they were signed: fix this before then."$'\n\n'"Run: ${run:-unknown}"
   fi
+  if [[ -n $unused ]]; then
+    raise_issue "Approval not used: install channel run ${GITHUB_RUN_ID:-unknown}" "The release approval for this run was not used and nothing was signed: $unused. A fresh run has been dispatched; approve that one."$'\n\n'"Run: ${run:-unknown}"
+  fi
   if [[ -n $code ]]; then
     [[ $code =~ $RE_HEX40 ]] || die "--code-change needs a commit sha."
     raise_issue "tend-install code changed ${code:0:7}" "Commit $code changed files outside site/ on main. Code here is replaced only by the operator's sync from the panel repository; if you did not make this change, treat the release key as exposed (docs/agent/panel-release-keys.md)."$'\n\n'"Commit: ${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/commit/$code"
   fi
 }
 
+
+# fresh [--site <dir>]: is the checkout this run was queued at still good to sign from?
+# Prints `state=current|code-only|site-moved` and, for site-moved, `reason=...`.
+# The plan is made from site/ and the registry, so only a change under site/ (a newer
+# release or re-sign published) makes it stale. Code, workflow and docs changes do not:
+# for those the checkout is fast-forwarded to the current main so the run signs with
+# the current scripts (the caller re-plans). A diverged history counts as site-moved.
+cmd_fresh() {
+  local site="site" head fetch
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --site) site="$2"; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  git fetch -q origin main || die "cannot fetch origin main."
+  head="$(git rev-parse HEAD)" fetch="$(git rev-parse FETCH_HEAD)"
+  if [[ $head == "$fetch" ]]; then echo "state=current"; return 0; fi
+  if ! git merge-base --is-ancestor "$head" "$fetch"; then
+    echo "state=site-moved"
+    echo "reason=main (${fetch:0:7}) is not a descendant of the commit this run was queued at (${head:0:7})"
+    return 0
+  fi
+  if ! git diff --quiet "$head" "$fetch" -- "$site"; then
+    echo "state=site-moved"
+    echo "reason=$site/ changed on main (${head:0:7} -> ${fetch:0:7}) while this run waited, so its plan is stale"
+    return 0
+  fi
+  git merge -q --ff-only "$fetch" || die "cannot fast-forward to ${fetch:0:7}."
+  say "main moved on (${head:0:7} -> ${fetch:0:7}) without touching $site/; continuing on the current main."
+  echo "state=code-only"
+}
 
 # Sourcing the file (the tests do) defines the functions and runs nothing.
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
@@ -906,6 +942,7 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     publish) shift; cmd_publish "$@" ;;
     alert) shift; cmd_alert "$@" ;;
     copy) shift; cmd_copy "$@" ;;
-    *) die "usage: tend-install.sh copy|plan|sign|publish|alert ..." ;;
+    fresh) shift; cmd_fresh "$@" ;;
+    *) die "usage: tend-install.sh copy|plan|sign|publish|alert|fresh ..." ;;
   esac
 fi

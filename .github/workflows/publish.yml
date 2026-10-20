@@ -34,8 +34,11 @@ name: Sign and publish the install channels
 # A newer run supersedes an older run that is only waiting for the `release`
 # approval (plan job, "Supersede older runs"); a run that is signing or pushing
 # is never cancelled.
-# A run that was queued behind the release approval and finds main moved on
-# stops cleanly: it never signs from a stale plan and never fails at push.
+# A run that was queued behind the release approval and finds only code moved
+# on main (nothing under site/) plans again on the current main and signs: the
+# approval is used. A run that finds site/ moved never signs from the stale plan:
+# it fails, the alert job opens "Approval not used", and the redispatch job
+# starts a fresh run to approve. Never sync this repository while a run waits.
 #
 # Manual run with dry_run: no copy; plans and signs with a throwaway key
 # generated in the run, verifies the result exactly as install.sh would,
@@ -212,6 +215,8 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: write
+    outputs:
+      stale_reason: ${{ steps.fresh.outputs.reason }}
     steps:
       # The deploy key is what may push to main past the ruleset (a raw push with any
       # other credential is refused). Until the cutover the secret is unset and the
@@ -219,39 +224,57 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ssh-key: ${{ secrets.TEND_INSTALL_DEPLOY_KEY }}
-      # A scheduled run is queued behind the `release` approval; when it is finally
-      # approved, a newer run may already have published, and this run's plan (made
-      # from the commit it was queued at) is stale. Signing and pushing it would be
-      # rejected ("fetch first") or, worse, re-sign over newer work. Stop cleanly
-      # instead: the next scheduled run plans again from the current main.
-      - name: Stop if main moved since this run was queued
+      # A run is queued behind the `release` approval; when it is finally approved,
+      # main may have moved. Only a change under site/ (a newer publish) makes the
+      # plan stale. A code, workflow or docs change does not: the checkout is
+      # fast-forwarded to the current main and the plan is made again below, so the
+      # approval is used. A stale plan never passes silently: the job fails, the
+      # alert job opens "Approval not used", and the redispatch job starts a fresh
+      # run for the operator to approve.
+      - name: Check whether main moved since this run was queued
         id: fresh
         run: |
           set -euo pipefail
-          git fetch -q origin main
-          if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
-            echo "::notice::main moved on ($(git rev-parse --short HEAD) -> $(git rev-parse --short FETCH_HEAD)) while this run waited; skipping it. The next scheduled run plans from the current main."
-            echo "stale=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "stale=0" >> "$GITHUB_OUTPUT"
-          fi
+          scripts/tend-install.sh fresh --site site | tee "$RUNNER_TEMP/fresh.env" >> "$GITHUB_OUTPUT"
+      - name: Fail loudly, the approval was not used
+        if: steps.fresh.outputs.state == 'site-moved'
+        env:
+          REASON: ${{ steps.fresh.outputs.reason }}
+        run: |
+          echo "::error::Approval not used: $REASON; a fresh run is dispatched, approve that one."
+          exit 1
       - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
-        if: steps.fresh.outputs.stale == '0'
         with:
           cosign-release: v2.4.1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        if: steps.fresh.outputs.stale == '0'
         with:
           name: plan
           path: ${{ runner.temp }}/plan
+      # Code-only move: the plan was made by the older scripts, so make it again
+      # (proof verification included) against the current main's site/ and code.
+      - name: Plan again on the current main
+        id: replan
+        if: steps.fresh.outputs.state == 'code-only'
+        env:
+          FORCE: ${{ inputs.force_resign && '--force-resign' || '' }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          scripts/tend-install.sh plan --site site --out "$RUNNER_TEMP/plan" $FORCE 2>&1 | tee "$RUNNER_TEMP/replan.log"
+          if [ "$(sed -n 's/^sign=//p' "$RUNNER_TEMP/plan/plan.env")" = 1 ]; then
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::the plan made again on the current main has nothing to sign; nothing to publish."
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          fi
       - name: Sign the channel manifests and install.sh
-        if: steps.fresh.outputs.stale == '0'
+        if: steps.replan.outputs.skip != '1'
         env:
           TEND_PANEL_RELEASE_KEY: ${{ secrets.TEND_PANEL_RELEASE_KEY }}
         run: scripts/tend-install.sh sign --site site --plan "$RUNNER_TEMP/plan"
       - name: Commit site/ and refresh the releases
         id: publish
-        if: steps.fresh.outputs.stale == '0'
+        if: steps.replan.outputs.skip != '1'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -323,14 +346,41 @@ jobs:
           COPY_RESULT: ${{ needs.copy.result }}
           PLAN_RESULT: ${{ needs.plan.result }}
           SIGN_RESULT: ${{ needs.sign.result }}
+          STALE_REASON: ${{ needs.sign.outputs.stale_reason }}
         run: |
           set -euo pipefail
           failed=""
-          for r in "$COPY_RESULT" "$PLAN_RESULT" "$SIGN_RESULT"; do
+          for r in "$COPY_RESULT" "$PLAN_RESULT"; do
             if [ "$r" = failure ]; then failed="--failed"; fi
           done
+          # A sign job that failed only because its plan went stale is reported as
+          # an unused approval (a fresh run is dispatched), not as a broken workflow.
+          unused=()
+          if [ "$SIGN_RESULT" = failure ]; then
+            if [ -n "$STALE_REASON" ]; then unused=(--approval-unused "$STALE_REASON"); else failed="--failed"; fi
+          fi
           # shellcheck disable=SC2086
-          scripts/tend-install.sh alert --plan "$RUNNER_TEMP/plan" $failed
+          scripts/tend-install.sh alert --plan "$RUNNER_TEMP/plan" $failed "${unused[@]}"
+
+  redispatch:
+    name: Dispatch a fresh run after an unused approval
+    needs: sign
+    if: ${{ always() && needs.sign.result == 'failure' && needs.sign.outputs.stale_reason != '' && !inputs.dry_run && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      # GITHUB_TOKEN may start workflow_dispatch runs (actions: write). The new run
+      # plans from the current main and waits for the operator's approval again.
+      - name: Dispatch publish.yml on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FORCE: ${{ inputs.force_resign && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          gh workflow run publish.yml --ref main -f force_resign="$FORCE"
+          echo "::notice::dispatched a fresh publish run; approve it."
 
   dry_run:
     name: Dry run (throwaway key)
