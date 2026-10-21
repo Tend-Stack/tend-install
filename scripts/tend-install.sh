@@ -62,8 +62,10 @@ RESIGN_AFTER=$((7 * 24 * 3600))
 PLATFORMS=(linux/amd64 linux/arm64)
 CHANNELS=(stable beta)
 WANT=(install.sh install-panel.sh tend-panel-release-1.pub.pem min-upgrade-from)
-OPTIONAL=(compose.yml.tmpl)
+OPTIONAL=(compose.yml.tmpl release-notes.txt)
 SCRIPT_DOMAIN="tend-install-script-v1"
+NOTES_DOMAIN="tend-panel-release-notes-v1"
+NOTES_MAX_BYTES=31000
 COMPOSE_DOMAIN="tend-install-compose-v1"
 COMPOSE_MARKER="# tend-compose-install: v1"
 COMPOSE_MAX=16384
@@ -482,6 +484,32 @@ sign_file() {
   rm -f "$msg"
 }
 
+# write_notes <release-notes.txt> <out> <version> <revision> <key id>: the change list as the JSON document
+# panelrelease.VerifyNotes reads (internal/panelrelease/notes.go). The image's file is one subject per line,
+# newest first; it is cleaned and capped like panelrelease.TrimNotes: control characters become spaces, lines
+# are trimmed and cut to 300 characters, empty lines dropped, at most 100 lines, and the oldest go until the
+# document fits. Returns 1 when no line is left, so an empty list is never signed.
+write_notes() {
+  local doc
+  doc="$(jq -Rsc --arg version "$3" --arg revision "$4" --arg keyid "$5" '
+    [split("\n")[] | gsub("\\p{Cc}"; " ") | gsub("^[\\s\\p{Z}]+|[\\s\\p{Z}]+$"; "") | select(length > 0)
+      | if length > 300 then .[0:299] + "…" else . end] | .[0:100] as $changes
+    | {schema: 1, key_id: $keyid, version: $version, revision: $revision, changes: $changes}' "$1")" || return 1
+  while (($(printf '%s\n' "$doc" | wc -c) > NOTES_MAX_BYTES)); do
+    doc="$(jq -c '.changes |= .[:-1]' <<< "$doc")" || return 1
+  done
+  jq -e '.changes | length > 0' <<< "$doc" > /dev/null || return 1
+  printf '%s\n' "$doc" > "$2"
+}
+
+# notes_signature_ok <doc> <sig> <scratch dir>: the signature is the signing key's, over "$NOTES_DOMAIN\n" + doc.
+notes_signature_ok() {
+  { printf '%s\n' "$NOTES_DOMAIN"; cat "$1"; } > "$3/notes.msg"
+  base64 -d "$2" > "$3/notes.sig" 2> /dev/null || return 1
+  printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "$SIGNING_SPKI" > "$3/notes.pub"
+  openssl pkeyutl -verify -pubin -inkey "$3/notes.pub" -rawin -in "$3/notes.msg" -sigfile "$3/notes.sig" > /dev/null 2>&1
+}
+
 # script_signature_ok <site> <scratch dir>: site/install.sh.sig is a valid signature (by the
 # release key; in a dry run also the throwaway one) over "$SCRIPT_DOMAIN\n" + install.sh.
 script_signature_ok() {
@@ -578,6 +606,23 @@ cmd_sign() {
     done
     mv "$site/v1/$ch.json.new" "$site/v1/$ch.json"
     mv "$site/v1/$ch.json.sig.new" "$site/v1/$ch.json.sig"
+    if [[ $action == release ]]; then
+      # The change list is optional: a missing, unreadable or empty release-notes.txt means no notes
+      # (panels say "Release notes unavailable") and never a failed release. A re-sign keeps the
+      # notes already published for the same version.
+      rm -f "$site/v1/notes-$version.json" "$site/v1/notes-$version.json.sig"
+      if [[ -f $plan/$ch/release-notes.txt ]] &&
+        write_notes "$plan/$ch/release-notes.txt" "$site/v1/notes-$version.json.new" "$version" "$revision" "$keyid" &&
+        sign_file "$key" "$NOTES_DOMAIN" "$site/v1/notes-$version.json.new" "$site/v1/notes-$version.json.sig.new" &&
+        notes_signature_ok "$site/v1/notes-$version.json.new" "$site/v1/notes-$version.json.sig.new" "$KEYDIR"; then
+        mv "$site/v1/notes-$version.json.new" "$site/v1/notes-$version.json"
+        mv "$site/v1/notes-$version.json.sig.new" "$site/v1/notes-$version.json.sig"
+        say "$ch: signed the change list of $version"
+      else
+        rm -f "$site/v1/notes-$version.json.new" "$site/v1/notes-$version.json.sig.new"
+        say "$ch: $version has no usable change list; panels will say the release notes are unavailable"
+      fi
+    fi
     if [[ -f $plan/$ch/install.sh && ($ch == stable || ! -f $site/install.sh) ]]; then
       grep -qF "\"$RELEASE_SPKI\"" "$plan/$ch/install.sh" || die "$ch: the image's install.sh does not pin the release key."
       cp "$plan/$ch/install.sh" "$site/install.sh"
@@ -618,12 +663,14 @@ cmd_sign() {
   fi
   rm -f "$key"
   # Only the stage 1 files a channel names stay on the site; releases keep the rest.
-  local keep f
+  local keep f nv
   keep=" "
   for ch in "${CHANNELS[@]}"; do
-    [[ -f $site/v1/$ch.json ]] && keep+="install-panel-$(sed -n 's/^  "version": "\(.*\)"$/\1/p' "$site/v1/$ch.json").sh "
+    [[ -f $site/v1/$ch.json ]] || continue
+    nv="$(sed -n 's/^  "version": "\(.*\)"$/\1/p' "$site/v1/$ch.json")"
+    keep+="install-panel-$nv.sh notes-$nv.json notes-$nv.json.sig "
   done
-  for f in "$site"/v1/install-panel-*.sh; do
+  for f in "$site"/v1/install-panel-*.sh "$site"/v1/notes-*.json "$site"/v1/notes-*.json.sig; do
     [[ -e $f && $keep != *" ${f##*/} "* ]] && rm -f "$f"
   done
   (cd "$site" && find . -type f ! -name SHA256SUMS ! -name '.*' -printf '%P\n' | LC_ALL=C sort | xargs sha256sum) > "$KEYDIR/SHA256SUMS"
