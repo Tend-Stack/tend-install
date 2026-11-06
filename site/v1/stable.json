@@ -1,15 +1,15 @@
 {
   "channel": "stable",
-  "expires_at": 1796574321,
+  "expires_at": 1796586104,
   "image": "ghcr.io/tend-stack/tend-host",
-  "image_digest": "sha256:8a38f61368060b7876162d63d6ddbd87d29dbf4cd88ceed2f5979e44677a570b",
+  "image_digest": "sha256:2c77f63266a1ff426748dcb92b162175595fd97cdc8e0d47ccd28a4097a889ec",
   "installer_sha256": "d97c2795af247c4f607c56cee72aced1fcf971cdcf23d0d230fddd66d778e919",
-  "installer_url": "https://get.tend.host/v1/install-panel-2026.1.2.sh",
+  "installer_url": "https://get.tend.host/v1/install-panel-2026.1.3.sh",
   "key_id": "a11d1c3fe5f86c14",
   "min_upgrade_from": "0.10.0",
   "platforms": ["linux/amd64", "linux/arm64"],
-  "published_at": 1793982321,
-  "revision": "42fd87b1bfc2d26d8328a91ac70c0db4fef09c3c",
+  "published_at": 1793994104,
+  "revision": "e19a01f7668c270e1864ca8b4e23770107136366",
   "schema": 1,
-  "version": "2026.1.2"
+  "version": "2026.1.3"
 }
