@@ -1,5 +1,5 @@
 # tend-compose-install: v1
-# Tend 2026.1.1. Start: docker compose up -d
+# Tend 2026.1.2. Start: docker compose up -d
 # Open: http://127.0.0.1:8787 (on a server: ssh -L 8787:127.0.0.1:8787 you@server)
 # Setup code: docker compose exec tend-host tend setup-code
 # Settings go in .env next to this file: TEND_PORT, TEND_BIND, TEND_DOMAIN, COMPOSE_PROFILES=https.
@@ -8,7 +8,7 @@ name: tend
 
 services:
   tend-host:
-    image: "${TEND_IMAGE:-ghcr.io/tend-stack/tend-host:2026.1.1@sha256:4a12ef3dc2c50a8b8047ec192540f507817fa2ada4881929e067f942971116c6}"
+    image: "${TEND_IMAGE:-ghcr.io/tend-stack/tend-host:2026.1.2@sha256:8a38f61368060b7876162d63d6ddbd87d29dbf4cd88ceed2f5979e44677a570b}"
     container_name: tend-host
     restart: unless-stopped
     ports:
@@ -27,7 +27,7 @@ services:
       TEND_SEED_PANEL_ADDRESS: "${TEND_DOMAIN:-}"
       TEND_SELF_UPDATE_MODE: channel
       TEND_UPDATE_CHANNEL: "${TEND_UPDATE_CHANNEL:-stable}"
-      TEND_HOST_EXEC_IMAGE: "${TEND_IMAGE:-ghcr.io/tend-stack/tend-host:2026.1.1@sha256:4a12ef3dc2c50a8b8047ec192540f507817fa2ada4881929e067f942971116c6}"
+      TEND_HOST_EXEC_IMAGE: "${TEND_IMAGE:-ghcr.io/tend-stack/tend-host:2026.1.2@sha256:8a38f61368060b7876162d63d6ddbd87d29dbf4cd88ceed2f5979e44677a570b}"
     volumes:
       - tend-data:/srv/data
       - /var/run/docker.sock:/var/run/docker.sock
