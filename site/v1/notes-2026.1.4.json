@@ -1,1 +1,0 @@
-{"schema":1,"key_id":"a11d1c3fe5f86c14","version":"2026.1.4","revision":"3a8a7f1e5d870a465222811683fd9376cbe1c28e","changes":["release: v2026.1.4","test(backup): read the writer's counter whole","fix(mcp): give requests 15 minutes and report expiry on deploy receipts"]}
