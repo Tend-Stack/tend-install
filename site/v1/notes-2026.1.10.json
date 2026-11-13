@@ -1,1 +1,0 @@
-{"schema":1,"key_id":"a11d1c3fe5f86c14","version":"2026.1.10","revision":"03c1fb2edc7004f06022008f705ea6e366fd0242","changes":["ci: qualify AMD64 release image on Mac runners","release: prepare 2026.1.10 native storage safeguards","fix: require native recovery for declared SQLite multiwriter storage"]}

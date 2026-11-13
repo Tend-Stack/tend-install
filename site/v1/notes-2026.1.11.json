@@ -1,0 +1,1 @@
+{"schema":1,"key_id":"a11d1c3fe5f86c14","version":"2026.1.11","revision":"7734f2282b0c42e4325fe07eef5f3bcc1aedca39","changes":["fix(api): preserve legacy null runtime compatibility","fix(edge): preserve explicit maintenance route holds"]}
