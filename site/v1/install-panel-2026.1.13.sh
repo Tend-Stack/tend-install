@@ -294,7 +294,8 @@ render_caddyfile() {
   # shellcheck disable=SC2016  # {$VAR} is Caddy's own placeholder
   printf '{\n\tadmin {$TEND_CADDY_CONTROL_IP}:2019\n\tskip_install_trust\n'
   [[ -z $email ]] || printf '\temail %s\n' "$email"
-  printf '}\n\n(panel) {\n\treverse_proxy %s:8787 {\n\t\tflush_interval -1\n\t\tunhealthy_request_count 1024\n\t}\n\tencode gzip\n}\n\n' "$PANEL_CONTROL_IP"
+  # stream_close_delay: a config reload must not cut the agent's and the browser's WebSockets (edge.PanelStreamCloseDelay).
+  printf '}\n\n(panel) {\n\treverse_proxy %s:8787 {\n\t\tflush_interval -1\n\t\tunhealthy_request_count 1024\n\t\tstream_close_delay 1h\n\t}\n\tencode gzip\n}\n\n' "$PANEL_CONTROL_IP"
   if [[ $profile == vps ]]; then
     printf '%s {\n\timport panel\n}\n' "$fqdn"
     if is_ipv4 "$ips"; then printf '\nhttp://%s {\n\tredir https://%s{uri} 308\n}\n' "$ips" "$fqdn"; fi
