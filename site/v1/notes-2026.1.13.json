@@ -1,1 +1,0 @@
-{"schema":1,"key_id":"a11d1c3fe5f86c14","version":"2026.1.13","revision":"c992c5867d08d858deb9141c3cac1a664f979934","changes":["release: v2026.1.13","fix(edge): keep the panel's WebSockets open across Caddy reloads","docs(strategy): record the agent direct route as applied"]}
