@@ -1,0 +1,1 @@
+{"schema":1,"key_id":"a11d1c3fe5f86c14","version":"2026.1.17","revision":"0e043a49223184889e73d0946ebae14e83238291","changes":["release: v2026.1.17","feat(deploy): use the server's copy when the registry has no such tag","fix(ui): keep database settings and other dialogs below the top bar"]}
