@@ -1,0 +1,1 @@
+{"schema":1,"key_id":"a11d1c3fe5f86c14","version":"2026.1.21","revision":"04b8e36b8004b663b201c63d837b0a36b8e7b870","changes":["release: v2026.1.21","docs(backup): say why End must run after settleCopies","fix(ui): re-read the copy card after a finished backup's cleanup"]}
